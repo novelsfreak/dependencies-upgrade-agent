@@ -14,13 +14,28 @@ import time
 import uuid
 
 import psycopg
+from dotenv import load_dotenv
 
 from core.claim import claim, release
 from core.heartbeat_guard import LeaseLostError
 from core.states import HANDLERS
 
+# Load .env BEFORE anything reads os.environ below or in core/states.py.
+# This was missing until now -- publisher.py had its own load_dotenv()
+# call, but the worker process (which runs handle_patch_ready, needing
+# GITHUB_TOKEN for the git push step) never loaded it, so GITHUB_TOKEN
+# and GITHUB_REPO were genuinely absent from this process's environment
+# regardless of what was sitting in .env on disk.
+from pathlib import Path
+from dotenv import load_dotenv
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+ENV_FILE = ROOT_DIR / ".env"
+
+load_dotenv(ENV_FILE)
+
 DSN = os.environ.get("DATABASE_URL", "postgresql://agent:agent@localhost:5431/agent")
-POLL_INTERVAL_SECONDS = 60.0
+POLL_INTERVAL_SECONDS = 1.0
 MAX_ATTEMPTS = 5
 MAX_BACKOFF_SECONDS = 300  # 5 minutes -- the cap Day 7 calls out as missing
 
@@ -92,7 +107,6 @@ def run_worker(worker_id: str | None = None) -> None:
             run = claim(conn, worker_id)
 
             if run is None:
-                log.info("Looking for a new Work");
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
@@ -101,10 +115,25 @@ def run_worker(worker_id: str | None = None) -> None:
             try:
                 handler = HANDLERS[run["state"]]
                 next_state, checkpoint_delta = handler(run, conn, worker_id)
-                release(conn, run["id"], next_state, checkpoint_delta)
-                log.info(
-                    "run %s moved %s -> %s", run["id"], run["state"], next_state
-                )
+
+                if checkpoint_delta.get("_released"):
+                    # This handler (currently only handle_patch_ready)
+                    # already committed its own state change, as part of
+                    # a transaction that also had to include something
+                    # else atomically (an outbox insert). Calling
+                    # release() here too would run a second, redundant
+                    # UPDATE outside that transaction and undo the
+                    # point of writing both changes together. Trust the
+                    # handler's own commit and just log it.
+                    log.info(
+                        "run %s moved %s -> %s (handler self-released)",
+                        run["id"], run["state"], next_state,
+                    )
+                else:
+                    release(conn, run["id"], next_state, checkpoint_delta)
+                    log.info(
+                        "run %s moved %s -> %s", run["id"], run["state"], next_state
+                    )
             except KeyError:
                 # A state with no handler reached the worker loop. Per
                 # core/states.py, this should be structurally impossible

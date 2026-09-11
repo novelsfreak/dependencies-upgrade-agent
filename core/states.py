@@ -20,11 +20,13 @@ by the WHERE clause in the first place. See core/claim.py.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
+import logging
 
 import psycopg
 
@@ -34,6 +36,13 @@ Handler = Any  # (run: dict, conn: psycopg.Connection, worker_id: str) -> tuple[
 
 BUILD_TIMEOUT_SECONDS = 600
 RUNS_LOG_DIR = Path("runs")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("states")
+
 
 
 def handle_created(run: dict, conn: psycopg.Connection, worker_id: str) -> tuple[str, dict]:
@@ -126,6 +135,21 @@ def handle_patching(run: dict, conn: psycopg.Connection, worker_id: str) -> tupl
                 f"npm install reported success but {manifest_path} did not change "
                 f"-- {dep_name} may already be at the requested version"
             )
+
+        # npm only touches the working tree -- without an actual commit,
+        # HEAD never moves past the cloned commit, so handle_patch_ready's
+        # `git push HEAD:refs/heads/branch` would push a branch identical
+        # to main (GitHub then rejects the PR with "No commits between
+        # main and <branch>").
+        subprocess.run(["git", "add", "-A"], cwd=repo_dir, capture_output=True, text=True)
+        commit = subprocess.run(
+            ["git", "-c", "user.email=agent@example.com", "-c", "user.name=upgrade-agent",
+             "commit", "-m", f"Upgrade {dep_name} to {target_version}"],
+            cwd=repo_dir, capture_output=True, text=True,
+        )
+        if commit.returncode != 0:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            raise RuntimeError(f"git commit failed: {commit.stderr[-800:]}")
     else:
         # Week 1 stub content, unchanged from Day 3 -- lets existing
         # tests keep working without a repo_url. Deliberately does NOT
@@ -297,11 +321,113 @@ def handle_testing(run: dict, conn: psycopg.Connection, worker_id: str) -> tuple
 
 def handle_patch_ready(run: dict, conn: psycopg.Connection, worker_id: str) -> tuple[str, dict]:
     """
-    Week 1 stub for what will become the outbox insert (Day 5): open a
-    branch, open a PR. For now just advance state so the pipeline can
-    be exercised end to end before the outbox exists.
+    Push the branch, then record "I intend to open a PR" as an outbox
+    row IN THE SAME TRANSACTION as the state change to PR_OPEN.
+
+    This does NOT call the GitHub PR-creation API itself -- that's
+    publisher.py's job, running as a separate process. Why split it
+    this way: GitHub's create-PR call and our DB update can't be one
+    atomic operation (they're two different systems), so if this
+    handler called GitHub directly and then crashed before writing to
+    the DB, a retry would call GitHub again and create a duplicate PR.
+    By only ever writing a durable INTENT here -- transactionally, with
+    the state change -- the actual GitHub call becomes something a
+    separate, retryable process can attempt as many times as it needs
+    to, safely, because it's driven off a row that either fully exists
+    or (if this transaction never committed) doesn't exist at all.
+
+    git push IS done directly here, not through the outbox. Pushing to
+    a fixed, deterministic branch name is naturally idempotent -- git
+    just fast-forwards or no-ops if nothing changed -- so it doesn't
+    need the same durability treatment as PR creation, which is NOT
+    idempotent on GitHub's side.
+
+    IMPORTANT: unlike every other handler, this one commits the state
+    change itself, as part of the same transaction as the outbox
+    insert. It returns a checkpoint_delta with "_released": True so the
+    worker loop knows NOT to also call release() -- doing so would run
+    a second, redundant UPDATE outside this transaction and defeat the
+    whole point of writing both changes atomically.
     """
-    return "PR_OPEN", {}
+    checkpoint = run.get("checkpoint") or {}
+    repo_dir = checkpoint.get("repo_dir")
+    dep_name = checkpoint.get("dep_name")
+    target_version = checkpoint.get("target_version")
+
+    if not repo_dir:
+        raise RuntimeError("no repo_dir in checkpoint -- this run's patch used the stub path, not a real repo")
+
+    token = os.environ.get("GITHUB_TOKEN")
+    repo_slug = os.environ.get("GITHUB_REPO")
+
+    if not token or not repo_slug:
+        raise RuntimeError("GITHUB_TOKEN and GITHUB_REPO must be set (see .env)")
+
+    log.info("Pushing to repo %s", repo_slug)
+
+    # Deterministic branch name -- same run, same dep, same target
+    # version always produces the same branch. This is what lets the
+    # publisher ask "does a PR already exist for this branch?" instead
+    # of having to trust its own bookkeeping alone.
+    branch = f"agent/upgrade/npm/{dep_name}-{target_version}"
+
+    # Authenticate the remote via token, then push. Done as separate
+    # steps so the token never appears in a command that could show up
+    # in a process listing or shell history.
+    set_url = subprocess.run(
+        ["git", "remote", "set-url", "origin", f"https://x-access-token:{token}@github.com/{repo_slug}.git"],
+        cwd=repo_dir, capture_output=True, text=True, timeout=30,
+    )
+    if set_url.returncode != 0:
+        raise RuntimeError(f"git remote set-url failed: {set_url.stderr[-800:]}")
+
+    # Plain --force, not --force-with-lease: the lease check needs a
+    # known remote tip to compare against, but handle_patching's clone
+    # never fetches this branch (only ever `main`), so git has no lease
+    # to check -- it would reject this push every time the branch
+    # already has any commit on it, on every retry, identically, since
+    # retries reuse the same clone that still never fetches it. Chaos
+    # testing proved this isn't hypothetical: 9 of 10 seeded runs died
+    # this way. This branch is exclusively owned by this automation (no
+    # human ever pushes to it directly), so the safety --force-with-lease
+    # buys elsewhere doesn't apply here -- plain --force is what actually
+    # delivers the "fixed branch name is naturally idempotent" behavior
+    # this function's own docstring describes.
+    push = subprocess.run(
+        ["git", "push", "--force", "origin", f"HEAD:refs/heads/{branch}"],
+        cwd=repo_dir, capture_output=True, text=True, timeout=60,
+    )
+    if push.returncode != 0:
+        raise RuntimeError(f"git push failed: {push.stderr[-800:]}")
+
+    idempotency_key = f"{run['id']}:open_pr"
+    payload = {
+        "repo": repo_slug,
+        "head_branch": branch,
+        "base_branch": "main",
+        "title": f"Upgrade {dep_name} to {target_version}",
+        "body": f"Automated upgrade for {dep_name} to {target_version}.\n\nrun_id: {run['id']}",
+    }
+
+    new_checkpoint = {**checkpoint, "branch": branch}
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE runs SET state = %s, checkpoint = %s::jsonb, lease_owner = NULL, "
+            "lease_expires_at = NULL, updated_at = now() WHERE id = %s",
+            ("PR_OPEN", json.dumps(new_checkpoint), run["id"]),
+        )
+        cur.execute(
+            """
+            INSERT INTO outbox (run_id, kind, payload, idempotency_key)
+            VALUES (%s, 'open_pr', %s, %s)
+            ON CONFLICT (idempotency_key) DO NOTHING
+            """,
+            (run["id"], json.dumps(payload), idempotency_key),
+        )
+    conn.commit()
+
+    return "PR_OPEN", {"_released": True}
 
 
 def handle_pr_open(run: dict, conn: psycopg.Connection, worker_id: str) -> tuple[str, dict]:

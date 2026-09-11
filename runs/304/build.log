@@ -1,6 +1,0 @@
-
-> expense-manager@0.0.0 build
-> tsc -b && vite build
-
-src/App.tsx(26,10): error TS6133: 'financialDataLoaded' is declared but its value is never read.
-src/components/StocksPortfolio.tsx(99,9): error TS6133: 'marketTotals' is declared but its value is never read.
