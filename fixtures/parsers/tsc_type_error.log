@@ -1,0 +1,6 @@
+
+> expense-manager@0.0.0 build
+> tsc -b && vite build
+
+src/main.tsx(15,7): error TS2322: Type 'string' is not assignable to type 'number'.
+src/main.tsx(15,7): error TS6133: 'brokenTypeError' is declared but its value is never read.
