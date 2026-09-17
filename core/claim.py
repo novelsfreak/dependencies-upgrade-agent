@@ -22,6 +22,7 @@ from psycopg.rows import dict_row
 ACTIONABLE_STATES = [
     "CREATED",
     "PATCHING",
+    "AGENT_PATCHING",
     "BUILDING",
     "TESTING",
     "PATCH_READY",

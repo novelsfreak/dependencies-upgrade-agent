@@ -22,6 +22,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -172,13 +173,31 @@ def handle_patching(run: dict, conn: psycopg.Connection, worker_id: str) -> tupl
     base_sha = None  # only meaningful on the real-repo path; stub path has no git history to diff
 
     if repo_url:
+        # Authenticated for GitHub URLs when a token is available --
+        # this used to be a bare anonymous clone, which only ever
+        # worked because the one repo tested against so far happened
+        # to be public. A private repo (the Week 3 disposable test
+        # fixture, deliberately private) 403s on an anonymous clone.
+        # Falls back to the plain URL if no token is set, so the
+        # existing public-repo path is unaffected.
+        clone_url = repo_url
+        token = os.environ.get("GITHUB_TOKEN")
+        if token and "github.com" in repo_url:
+            clone_url = repo_url.replace("https://github.com/", f"https://x-access-token:{token}@github.com/")
+
         result = subprocess.run(
-            ["git", "clone", "--depth", "1", repo_url, str(work_dir / "repo")],
+            ["git", "clone", "--depth", "1", clone_url, str(work_dir / "repo")],
             capture_output=True, text=True, timeout=120,
         )
         if result.returncode != 0:
             shutil.rmtree(work_dir, ignore_errors=True)
-            raise RuntimeError(f"git clone failed: {result.stderr}")
+            # Defense in depth on top of whatever git itself redacts:
+            # this error text ends up in checkpoint.last_error, which
+            # is regular application data, not a secret store -- the
+            # embedded token must never appear in it regardless of
+            # what git's own error output happens to contain.
+            safe_stderr = result.stderr.replace(token, "***") if token else result.stderr
+            raise RuntimeError(f"git clone failed: {safe_stderr}")
         repo_dir = work_dir / "repo"
 
         # The clone's own HEAD, before the bump commit goes on top --
@@ -280,7 +299,16 @@ def handle_patching(run: dict, conn: psycopg.Connection, worker_id: str) -> tupl
     patch_path = work_dir / "changes.patch"
     patch_path.write_text(patch_summary)
 
-    return "BUILDING", {
+    # Week 3: the deterministic bump above (manifest + lockfile, done
+    # correctly via adapter.bump()) still happens either way -- that
+    # part is mechanical and error-prone for a model to redo from a
+    # diff. use_agent only decides whether the CALL-SITE fixes that
+    # bump requires get done deterministically (they don't, today's
+    # week-1 stub silently doesn't need any) or by the Week 3 agent
+    # loop, which picks up from this same clone.
+    next_state = "AGENT_PATCHING" if checkpoint.get("use_agent") else "BUILDING"
+
+    return next_state, {
         "work_dir": str(work_dir),
         "repo_dir": str(repo_dir),
         "patch_path": str(patch_path),
@@ -519,6 +547,14 @@ def handle_testing(run: dict, conn: psycopg.Connection, worker_id: str) -> tuple
         "test_result": dataclasses.asdict(test_result),
     }
 
+def _repo_slug_from_url(repo_url: str) -> str | None:
+    """"https://github.com/owner/repo.git" -> "owner/repo". Returns None
+    for anything that isn't recognizably a GitHub URL (a local path used
+    by a test, for instance) rather than guessing."""
+    match = re.search(r"github\.com[:/]([^/]+)/([^/.]+)", repo_url)
+    return f"{match.group(1)}/{match.group(2)}" if match else None
+
+
 def handle_patch_ready(run: dict, conn: psycopg.Connection, worker_id: str) -> tuple[str, dict]:
     """
     Push the branch, then record "I intend to open a PR" as an outbox
@@ -558,10 +594,24 @@ def handle_patch_ready(run: dict, conn: psycopg.Connection, worker_id: str) -> t
         raise RuntimeError("no repo_dir in checkpoint -- this run's patch used the stub path, not a real repo")
 
     token = os.environ.get("GITHUB_TOKEN")
-    repo_slug = os.environ.get("GITHUB_REPO")
+    if not token:
+        raise RuntimeError("GITHUB_TOKEN must be set (see .env)")
 
-    if not token or not repo_slug:
-        raise RuntimeError("GITHUB_TOKEN and GITHUB_REPO must be set (see .env)")
+    # Derived from THIS run's own repo_url, not a single global
+    # GITHUB_REPO env var. That env var used to be the only source here
+    # -- fine when every run targets the same one repo, a real hazard
+    # the moment a second real repo enters the picture: every run would
+    # force-push to whatever GITHUB_REPO happened to be set to,
+    # regardless of which repo it actually cloned. Falls back to the
+    # env var only for backward compatibility with anything that never
+    # set repo_url.
+    repo_url = checkpoint.get("repo_url")
+    repo_slug = _repo_slug_from_url(repo_url) if repo_url else os.environ.get("GITHUB_REPO")
+    if not repo_slug:
+        raise RuntimeError(
+            "could not determine target repo -- checkpoint has no repo_url and "
+            "GITHUB_REPO is not set (see .env)"
+        )
 
     log.info("Pushing to repo %s", repo_slug)
 
@@ -630,6 +680,25 @@ def handle_patch_ready(run: dict, conn: psycopg.Connection, worker_id: str) -> t
     return "PR_OPEN", {"_released": True}
 
 
+def handle_agent_patching(run: dict, conn: psycopg.Connection, worker_id: str) -> tuple[str, dict]:
+    """
+    Week 3: the LLM tool-use loop. handle_patching already cloned the
+    repo and did the deterministic manifest/lockfile bump before
+    routing here -- this picks up that same clone and fixes whatever
+    call sites the bump broke.
+
+    Returns "BUILDING" on the model's own belief that it's done (not
+    trusted alone -- BUILDING/TESTING re-verify independently, same as
+    every mid-loop run_build/run_tests call already gets), or
+    "ESCALATED" if a stop condition tripped or the model called
+    give_up. Any other exception (a Groq API error, for instance)
+    propagates up through the normal handle_failure retry/backoff path,
+    same as any other handler.
+    """
+    from agent.loop import run_agent_loop
+    return run_agent_loop(run, conn, worker_id)
+
+
 def handle_pr_open(run: dict, conn: psycopg.Connection, worker_id: str) -> tuple[str, dict]:
     """
     A PR is open. From here a worker has nothing left to do -- the next
@@ -640,14 +709,18 @@ def handle_pr_open(run: dict, conn: psycopg.Connection, worker_id: str) -> tuple
     return "AWAITING_CI", {}
 
 
-# AWAITING_CI is deliberately absent from this dict. If claim() ever
-# somehow returned a run in that state (it shouldn't -- see
-# ACTIONABLE_STATES in core/claim.py), HANDLERS[run["state"]] would
-# raise a KeyError rather than silently doing nothing. Loud failure
-# over silent one.
+# AWAITING_CI and ESCALATED are deliberately absent from this dict.
+# AWAITING_CI only moves on a webhook (see ACTIONABLE_STATES in
+# core/claim.py). ESCALATED is terminal, same pattern as FAILED --
+# never in ACTIONABLE_STATES, so claim() structurally can never select
+# it and a worker never needs a handler for it. If claim() ever somehow
+# returned a run in either state, HANDLERS[run["state"]] would raise a
+# KeyError rather than silently doing nothing. Loud failure over silent
+# one.
 HANDLERS: dict[str, Handler] = {
     "CREATED": handle_created,
     "PATCHING": handle_patching,
+    "AGENT_PATCHING": handle_agent_patching,
     "BUILDING": handle_building,
     "TESTING": handle_testing,
     "PATCH_READY": handle_patch_ready,

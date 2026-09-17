@@ -106,7 +106,19 @@ def handle_failure(conn: psycopg.Connection, run: dict, error: Exception) -> Non
     A handler raised. Bump attempt, compute backoff, and either send the
     run back to retry from its current state or, past MAX_ATTEMPTS, park
     it in FAILED so it stops being retried forever.
+
+    Rolls back first -- observed for real: a handler that raised because
+    a SQL statement itself failed (a foreign-key violation, in the one
+    case this actually happened) leaves the connection in Postgres's
+    "current transaction is aborted" state. Calling release()'s own
+    UPDATE on that same, still-dirty connection without rolling back
+    first raises a SECOND exception (InFailedSqlTransaction) that this
+    function doesn't catch -- which used to propagate all the way out
+    of run_worker's main loop and kill the entire worker process over
+    ONE bad run, silently taking every other run it could have kept
+    processing down with it.
     """
+    conn.rollback()
     attempt = run["attempt"] + 1
     log.warning(
         "run %s failed on attempt %s in state %s: %s",
