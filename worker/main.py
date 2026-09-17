@@ -8,6 +8,7 @@ state-specific behavior lives in core/states.py.
 from __future__ import annotations
 
 import logging
+import subprocess
 import os
 import sys
 import time
@@ -15,10 +16,14 @@ import uuid
 
 import psycopg
 from dotenv import load_dotenv
+from psycopg.rows import dict_row
 
 from core.claim import claim, release
 from core.heartbeat_guard import LeaseLostError
+from core.repo_lock import LockContention
 from core.states import HANDLERS
+
+LOCK_CONTENTION_BACKOFF_SECONDS = 30
 
 # Load .env BEFORE anything reads os.environ below or in core/states.py.
 # This was missing until now -- publisher.py had its own load_dotenv()
@@ -45,6 +50,47 @@ logging.basicConfig(
 )
 log = logging.getLogger("worker")
 
+def sweep_orphaned_containers(conn: psycopg.Connection) -> None:
+    """
+    On worker boot: find containers matching upgrade-* whose run is not
+    currently leased (lease expired, or run gone entirely), and kill them.
+    Prevents orphaned containers from a crashed worker quietly eating
+    host resources over a long soak.
+
+    The "still leased" check is done in SQL (lease_expires_at > now())
+    rather than comparing to a Python-side now() -- avoids a tz-aware
+    vs. naive datetime mismatch, and one round trip per container.
+    """
+    result = subprocess.run(
+        ["docker", "ps", "--format", "{{.Names}}", "--filter", "name=upgrade-"],
+        capture_output=True, text=True,
+    )
+    container_names = [n for n in result.stdout.splitlines() if n]
+
+    for name in container_names:
+        # name shape: upgrade-{run_id}-{attempt}-{phase}
+        parts = name.split("-")
+        try:
+            run_id = int(parts[1])
+        except (IndexError, ValueError):
+            log.warning(
+                "sweep: container name %s doesn't match upgrade-{run_id}-{attempt}-{phase}, skipping",
+                name,
+            )
+            continue
+
+        with conn.cursor(row_factory=dict_row) as cur:
+            row = cur.execute(
+                "SELECT id FROM runs WHERE id = %(id)s AND lease_expires_at > now()",
+                {"id": run_id},
+            ).fetchone()
+
+        if row is None:
+            log.info(
+                "sweep: killing orphaned container %s (run %s not currently leased)",
+                name, run_id,
+            )
+            subprocess.run(["docker", "kill", name], capture_output=True)
 
 def backoff_seconds(attempt: int) -> int:
     """
@@ -103,6 +149,9 @@ def run_worker(worker_id: str | None = None) -> None:
     log.info("starting worker %s", worker_id)
 
     with psycopg.connect(DSN, autocommit=False) as conn:
+        sweep_orphaned_containers(conn)
+        conn.commit()
+
         while True:
             run = claim(conn, worker_id)
 
@@ -154,6 +203,17 @@ def run_worker(worker_id: str | None = None) -> None:
                 # whatever worker holds the lease now is responsible for
                 # it. Just log and go back to polling for other work.
                 log.warning("run %s: %s -- ceding, not touching the row", run["id"], e)
+            except LockContention as e:
+                # Another run against this same repo is mid install/build
+                # right now. Pure backpressure, not a failure: requeue in
+                # the SAME state with a short delay, don't bump attempt,
+                # don't record last_error -- this isn't a defect in the
+                # run, it's just contention that will clear on its own.
+                log.info("run %s: %s -- requeuing in %ss", run["id"], e, LOCK_CONTENTION_BACKOFF_SECONDS)
+                release(
+                    conn, run["id"], run["state"],
+                    next_attempt_at_sql=f"now() + interval '{LOCK_CONTENTION_BACKOFF_SECONDS} seconds'",
+                )
             except Exception as e:
                 handle_failure(conn, run, e)
 

@@ -164,18 +164,20 @@ def seed_runs(conn: psycopg.Connection, n: int) -> list[str]:
     repo_url = f"https://github.com/{GITHUB_REPO}.git"
 
     existing_repo = conn.execute(
-        "SELECT id FROM repos WHERE url = %s", (repo_url,)
+        "SELECT id, sandbox_image FROM repos WHERE url = %s", (repo_url,)
     ).fetchone()
     if existing_repo:
         repo_id = existing_repo["id"]
+        sandbox_image = existing_repo["sandbox_image"]
     else:
+        sandbox_image = "node:20"
         repo_id = conn.execute(
             """
-            INSERT INTO repos (url, default_branch, ecosystem, build_cmd, test_cmd)
-            VALUES (%s, 'main', 'npm', 'npm run build', 'npm test')
+            INSERT INTO repos (url, default_branch, ecosystem, build_cmd, test_cmd, sandbox_image)
+            VALUES (%s, 'main', 'npm', 'npm run build', 'npm test', %s)
             RETURNING id
             """,
-            (repo_url,),
+            (repo_url, sandbox_image),
         ).fetchone()["id"]
 
     run_ids = []
@@ -220,6 +222,10 @@ def seed_runs(conn: psycopg.Connection, n: int) -> list[str]:
             "dep_name": dep_name,
             "current_version": "unknown",  # not asserted anywhere; real diff comes from git diff --stat
             "target_version": target_version,
+            # sandbox_image lives on repos, not runs -- copied onto the
+            # checkpoint here since handle_building reads it off
+            # checkpoint, not off a live join (see core/states.py).
+            "sandbox_image": sandbox_image,
         }
         row = conn.execute(
             """
@@ -515,6 +521,76 @@ def check_no_double_published_outbox(conn: psycopg.Connection, run_ids: list[str
     return problems
 
 
+def check_no_orphaned_containers() -> list[str]:
+    """
+    Round 2 (sandbox era): every container this run could have started
+    is named upgrade-{run_id}-{attempt}-{phase} (see core/states.py) and
+    launched with --rm. By the time this runs, every worker process has
+    already been killed (main() stops the pool before invariant checks)
+    -- so if a container matching this pattern is still alive, either
+    --rm didn't fire (killed mid-`docker run` before the daemon
+    registered it) or the Day 1 boot-time sweep has a gap. Either way,
+    it's exactly the "orphaned container quietly eating the host"
+    failure mode Day 1 and Day 7 both call out.
+    """
+    result = subprocess.run(
+        ["docker", "ps", "--filter", "name=upgrade-", "--format", "{{.Names}}"],
+        capture_output=True, text=True,
+    )
+    names = [n for n in result.stdout.splitlines() if n]
+    return [f"container {n} still running after chaos window + drain" for n in names]
+
+
+def check_no_orphaned_advisory_locks() -> list[str]:
+    """
+    Round 2 (locking era): by the time this runs every worker's
+    connection has been killed, which -- per core/repo_lock.py's whole
+    reason for using session-scoped, not transaction-scoped, locks --
+    should have released every advisory lock those connections held.
+    A lock still showing in pg_locks here means some connection either
+    didn't die, or died without Postgres cleaning up after it (the
+    "advisory lock held by a dead connection blocking everything"
+    scenario this test exists to catch).
+    """
+    conn = db_connect()
+    rows = conn.execute(
+        "SELECT pid, objid FROM pg_locks WHERE locktype = 'advisory'"
+    ).fetchall()
+    conn.close()
+    return [
+        f"advisory lock still held: pid={r['pid']} objid={r['objid']}"
+        for r in rows
+    ]
+
+
+def check_run_dirs_match_db(conn: psycopg.Connection) -> list[str]:
+    """
+    Round 2 (logging era): every runs/{id}/ directory on disk should
+    trace back to a real row in the runs table. A directory with no
+    matching row is disk usage nobody will ever clean up -- the exact
+    "disk filling with directories nobody cleaned up" scenario Day 7
+    calls out, just for log dirs instead of /out dirs (patch extraction
+    writes into the same runs/{id}/{attempt}/ tree, so one check covers
+    both).
+    """
+    runs_dir = Path("runs")
+    if not runs_dir.is_dir():
+        return []
+
+    on_disk_ids = {p.name for p in runs_dir.iterdir() if p.is_dir() and p.name.isdigit()}
+    if not on_disk_ids:
+        return []
+
+    rows = conn.execute(
+        "SELECT id FROM runs WHERE id = ANY(%s)",
+        ([int(i) for i in on_disk_ids],),
+    ).fetchall()
+    known_ids = {str(r["id"]) for r in rows}
+
+    orphaned = on_disk_ids - known_ids
+    return [f"runs/{i}/ on disk has no matching row in runs table" for i in sorted(orphaned)]
+
+
 def report_final_states(conn: psycopg.Connection, run_ids: list[str]) -> None:
     rows = conn.execute(
         "SELECT id, state, attempt, lease_owner FROM runs WHERE id = ANY(%s) ORDER BY id",
@@ -606,6 +682,27 @@ def _run_invariant_checks(conn: psycopg.Connection, run_ids: list[str], all_prob
 
     print("\n[4] no duplicate outbox publishes")
     problems = check_no_double_published_outbox(conn, run_ids)
+    all_problems += problems
+    print(f"  {len(problems)} problem(s) found" if problems else "  none found")
+    for p in problems:
+        print(f"  FAIL: {p}")
+
+    print("\n[5] no orphaned upgrade-* containers (round 2, sandbox era)")
+    problems = check_no_orphaned_containers()
+    all_problems += problems
+    print(f"  {len(problems)} problem(s) found" if problems else "  none found")
+    for p in problems:
+        print(f"  FAIL: {p}")
+
+    print("\n[6] no orphaned advisory locks (round 2, locking era)")
+    problems = check_no_orphaned_advisory_locks()
+    all_problems += problems
+    print(f"  {len(problems)} problem(s) found" if problems else "  none found")
+    for p in problems:
+        print(f"  FAIL: {p}")
+
+    print("\n[7] every runs/{id}/ dir on disk maps to a real run row (round 2, logging era)")
+    problems = check_run_dirs_match_db(conn)
     all_problems += problems
     print(f"  {len(problems)} problem(s) found" if problems else "  none found")
     for p in problems:

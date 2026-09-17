@@ -15,9 +15,9 @@ longer authorized by the system's own bookkeeping to be doing so.
 """
 from __future__ import annotations
 
-import subprocess
 import threading
 import time
+from typing import Callable
 
 import psycopg
 
@@ -45,12 +45,22 @@ class HeartbeatGuard:
     """
     Usage:
         proc = subprocess.Popen([...])
-        with HeartbeatGuard(conn, run_id, worker_id, proc):
+        with HeartbeatGuard(conn, run_id, worker_id, kill_fn=proc.kill):
             proc.wait(timeout=600)
 
     While the `with` block is open, a background thread heartbeats every
     HEARTBEAT_INTERVAL_SECONDS. If heartbeat() ever returns False (lease
-    lost), the guard kills `proc` immediately and stops.
+    lost), the guard calls `kill_fn()` immediately and stops.
+
+    kill_fn, not a bare proc: for a plain subprocess, kill_fn=proc.kill
+    is enough. But for work running inside a container (see
+    sandbox/executor.py), the Popen the caller holds is only the `docker
+    run` CLI wrapper -- killing it does not stop the container, which
+    would be left running, orphaned, no longer authorized by this
+    system's own bookkeeping to be doing anything. The caller is the one
+    who knows how its work actually needs to be torn down, so it passes
+    that down as a callable instead of this class assuming proc.kill()
+    is always correct.
     """
 
     def __init__(
@@ -58,12 +68,12 @@ class HeartbeatGuard:
         conn: psycopg.Connection,
         run_id: int,
         worker_id: str,
-        proc: subprocess.Popen,
+        kill_fn: Callable[[], None],
     ):
         self._conn = conn
         self._run_id = run_id
         self._worker_id = worker_id
-        self._proc = proc
+        self._kill_fn = kill_fn
         self._stop_event = threading.Event()
         self._lease_lost = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -81,7 +91,7 @@ class HeartbeatGuard:
             still_owned = heartbeat(self._conn, self._run_id, self._worker_id)
             if not still_owned:
                 self._lease_lost.set()
-                self._proc.kill()
+                self._kill_fn()
                 return
 
     def __enter__(self) -> "HeartbeatGuard":

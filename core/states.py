@@ -19,23 +19,92 @@ by the WHERE clause in the first place. See core/claim.py.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 import logging
 
 import psycopg
 
+from adapters import ADAPTERS
+from adapters.base import BuildError, StepResult, add_source_context
 from core.heartbeat_guard import HeartbeatGuard, LeaseLostError
+from core.logs import log_dir_for
+from core.repo_lock import LockContention, try_lock_repo, unlock_repo
+from sandbox.executor import kill_sandbox, start_sandbox
+from sandbox.network import EGRESS_NETWORK, PROXY_URL, ensure_egress_proxy
 
 Handler = Any  # (run: dict, conn: psycopg.Connection, worker_id: str) -> tuple[str, dict]
 
 BUILD_TIMEOUT_SECONDS = 600
-RUNS_LOG_DIR = Path("runs")
+
+
+class BuildFailed(RuntimeError):
+    """
+    Raised by handle_building/handle_testing when the adapter's own
+    parse_build/parse_test says the step failed. str(error) is a JSON
+    dump of the StepResult, not prose -- handle_failure's
+    checkpoint_delta stores str(error) as "last_error" verbatim, so this
+    is what makes that field genuinely structured (file/line/code/
+    context, capped at 6, true error_count) instead of a raw text tail.
+    """
+    def __init__(self, step_result: StepResult):
+        self.step_result = step_result
+        super().__init__(json.dumps(dataclasses.asdict(step_result)))
+
+
+# 137 = 128 + SIGKILL(9), Linux/Docker's universal convention for "this
+# process was killed", the OOM killer included. Checked here, not in
+# any one adapter, because the convention is a Docker/OS-level fact,
+# not something tsc/jest/mypy/pytest output ever encodes themselves.
+_OOM_EXIT_CODE = 137
+
+
+def _classify_infra_failure(result: StepResult, exit_code: int) -> None:
+    """
+    Reclassifies a StepResult's status from "failed" to "infra_error"
+    in place when the exit code itself says this wasn't the tool
+    reporting a real error -- it was the container being killed out
+    from under it. Distinguishing the two matters: "failed" means the
+    code has a real problem to fix; "infra_error" means retrying with
+    more memory (or just retrying) is the right move, not debugging the
+    diff.
+    """
+    if exit_code == _OOM_EXIT_CODE and result.status == "failed":
+        result.status = "infra_error"
+
+
+def _timeout_step_result(cmd: list[str], timeout_seconds: int, log_path: Path) -> StepResult:
+    return StepResult(
+        status="timeout",
+        error_count=1,
+        errors=[BuildError(
+            file="", line=None, col=None, code=None,
+            message=f"{' '.join(cmd)} exceeded {timeout_seconds}s",
+        )],
+        log_ref=str(log_path),
+    )
+
+
+# Only "install" genuinely needs the registry -- the build and test
+# phases execute the third-party code that npm/pip just downloaded,
+# which is exactly the code we don't trust with a network. Splitting
+# by phase means that untrusted code never has anywhere to reach.
+PHASE_NETWORK = {
+    "install": EGRESS_NETWORK,
+    "build": "none",
+    "test": "none",
+}
+
+# Explicit allowlist, never the host's environment. Nothing here is
+# secret-shaped on purpose -- see test_no_secrets_in_sandbox_env.
+BASE_SANDBOX_ENV = {"CI": "true"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -92,12 +161,15 @@ def handle_patching(run: dict, conn: psycopg.Connection, worker_id: str) -> tupl
     current_version = checkpoint.get("current_version", "1.6.2")
     target_version = checkpoint.get("target_version", "1.7.0")
     repo_url = checkpoint.get("repo_url")
+    ecosystem = checkpoint.get("ecosystem", "npm")
+    adapter = ADAPTERS[ecosystem]
 
     # Always work in a fresh temp dir per attempt -- never mutate
     # anything in place. This is the fix for the Day 7 chaos failure
     # mode: "a handler that mutates state on disk before committing to
     # the DB, so a retry sees a half-applied patch."
     work_dir = Path(tempfile.mkdtemp(prefix=f"run-{run['id']}-"))
+    base_sha = None  # only meaningful on the real-repo path; stub path has no git history to diff
 
     if repo_url:
         result = subprocess.run(
@@ -109,30 +181,34 @@ def handle_patching(run: dict, conn: psycopg.Connection, worker_id: str) -> tupl
             raise RuntimeError(f"git clone failed: {result.stderr}")
         repo_dir = work_dir / "repo"
 
+        # The clone's own HEAD, before the bump commit goes on top --
+        # this is what handle_building's patch extraction later diffs
+        # against, so the patch is exactly "what the bump changed"
+        # regardless of whether it added, deleted, or modified files.
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo_dir, capture_output=True, text=True,
+        ).stdout.strip()
+
         manifest_full_path = repo_dir / manifest_path
         before = manifest_full_path.read_text()
 
-        # npm's own resolver updates package.json AND package-lock.json
-        # together. package-lock=true is the default but stated
-        # explicitly: this must never silently skip the lockfile.
-        install = subprocess.run(
-            ["npm", "install", f"{dep_name}@{target_version}", "--package-lock=true"],
-            cwd=repo_dir, capture_output=True, text=True, timeout=180,
-        )
-        if install.returncode != 0:
+        # Ecosystem-specific: the adapter knows how to update its
+        # manifest AND lockfile together (see NpmAdapter.bump's
+        # docstring for why a plain string-replace isn't enough).
+        try:
+            adapter.bump(repo_dir, dep_name, target_version)
+        except Exception:
             shutil.rmtree(work_dir, ignore_errors=True)
-            raise RuntimeError(
-                f"npm install {dep_name}@{target_version} failed: {install.stderr[-800:]}"
-            )
+            raise
 
         after = manifest_full_path.read_text()
         if after == before:
-            # npm exited 0 but changed nothing -- e.g. target_version
+            # bump() exited 0 but changed nothing -- e.g. target_version
             # resolves to what's already installed. Loud failure, not a
             # silently-green no-op run.
             shutil.rmtree(work_dir, ignore_errors=True)
             raise ValueError(
-                f"npm install reported success but {manifest_path} did not change "
+                f"{ecosystem} bump reported success but {manifest_path} did not change "
                 f"-- {dep_name} may already be at the requested version"
             )
 
@@ -211,6 +287,8 @@ def handle_patching(run: dict, conn: psycopg.Connection, worker_id: str) -> tupl
         "manifest_path": manifest_path,
         "dep_name": dep_name,
         "target_version": target_version,
+        "ecosystem": ecosystem,
+        "base_sha": base_sha,
     }
 
 
@@ -220,104 +298,226 @@ def _run_subprocess_step(
     worker_id: str,
     cmd: list[str],
     log_name: str,
-) -> tuple[int, str]:
+    phase: str,  # "install" | "build" | "test" -- feeds the container name
+) -> tuple[int, str, str, int]:
     """
     Shared machinery for handle_building and handle_testing: run `cmd`
-    in the run's repo_dir, heartbeat the lease for the duration, enforce
-    a hard timeout, and persist the full log to disk.
+    inside a disposable container, heartbeat the lease for the duration,
+    enforce a hard timeout, and persist the full log to disk.
 
-    Returns (exit_code, log_path). Does NOT decide next_state -- that's
-    the caller's job, since "exit code 0 means what" differs between a
-    build and a test run only in name, not in mechanics.
+    Returns (exit_code, stdout, log_path, duration_ms). Does NOT decide
+    next_state or shape errors -- callers own that (they're the ones who
+    know which adapter method, parse_build vs. parse_test, applies).
     """
     checkpoint = run.get("checkpoint") or {}
     repo_dir = checkpoint.get("repo_dir") or checkpoint.get("work_dir")
     if not repo_dir:
         raise RuntimeError("no repo_dir/work_dir in checkpoint -- did PATCHING run first?")
 
-    log_dir = RUNS_LOG_DIR / str(run["id"])
+    adapter = ADAPTERS[checkpoint["ecosystem"]]
+
+    # runs/{run_id}/{attempt}/{phase}.log -- attempt-scoped so a retried
+    # run's logs from a prior failed attempt aren't overwritten, and so
+    # log_ref (e.g. "370/1/build") unambiguously names one execution.
+    log_dir = log_dir_for(run["id"], run["attempt"])
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / log_name
 
-    proc = subprocess.Popen(
-        cmd,
-        cwd=repo_dir,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
+    container_name = f"upgrade-{run['id']}-{run['attempt']}-{phase}"
+    # sandbox_image lives on repos, not runs -- runs has no such column.
+    # Per this file's own week-1 pattern (repo_url, dep_name, etc. are
+    # threaded through checkpoint rather than joined live), whatever
+    # creates the run is expected to have copied repos.sandbox_image
+    # onto checkpoint at creation time. release()'s checkpoint merge
+    # (`checkpoint || delta`) preserves it across every later state
+    # transition without handle_patching needing to forward it by hand.
+    # Falls back to the adapter's own default_image, not a literal.
+    image = checkpoint.get("sandbox_image") or adapter.default_image
+
+    network = PHASE_NETWORK[phase]
+    env = dict(BASE_SANDBOX_ENV)
+    volumes = {}
+    if phase == "install":
+        # Only the install phase gets a route out, and only to the
+        # allowlisted proxy -- never straight to the internet.
+        ensure_egress_proxy()
+        env["HTTP_PROXY"] = PROXY_URL
+        env["HTTPS_PROXY"] = PROXY_URL
+        env["NO_PROXY"] = "localhost,127.0.0.1"
+        # Shared across every run of this ecosystem -- core.repo_lock is
+        # what keeps two concurrent installs of the SAME repo from
+        # corrupting it; unrelated repos installing at the same time
+        # still share this volume, same as the plan describes.
+        volumes[adapter.cache_volume] = adapter.cache_mount_path
+
+    started_at = time.monotonic()
+    proc = start_sandbox(
+        image=image,
+        workdir=Path(repo_dir),
+        cmd=cmd,
+        name=container_name,
+        network=network,
+        env=env,
+        volumes=volumes,
     )
 
-    # The heartbeat guard renews the lease every 30s while we block on
-    # proc below. If it ever loses the lease, it kills proc itself --
-    # we don't have to poll for that ourselves, we just notice the
-    # process died early and lease_lost is set.
-    guard = HeartbeatGuard(conn, run["id"], worker_id, proc)
+    # HeartbeatGuard must kill by container name now, not proc.kill() --
+    # proc here is the `docker run` wrapper; killing it leaves the
+    # container running orphaned. See kill_sandbox().
+    guard = HeartbeatGuard(conn, run["id"], worker_id, kill_fn=lambda: kill_sandbox(container_name))
     with guard:
         try:
             stdout, _ = proc.communicate(timeout=BUILD_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            kill_sandbox(container_name)
             stdout, _ = proc.communicate()
             log_path.write_text(stdout + "\n\n[TIMED OUT after {}s]".format(BUILD_TIMEOUT_SECONDS))
-            raise TimeoutError(f"{' '.join(cmd)} exceeded {BUILD_TIMEOUT_SECONDS}s")
+            # Routed through the same StepResult/BuildFailed shape as a
+            # real build/test failure, status="timeout" instead of
+            # "failed" -- so checkpoint.last_error is structured JSON
+            # here too, not a plain string a future model would have to
+            # special-case.
+            raise BuildFailed(_timeout_step_result(cmd, BUILD_TIMEOUT_SECONDS, log_path))
 
+    duration_ms = int((time.monotonic() - started_at) * 1000)
     log_path.write_text(stdout)
 
     if guard.lease_lost:
-        # We were superseded mid-build. The other worker now owns this
-        # run -- we must not report success or failure back to the DB
-        # at all, since release() would be writing to a run we no
-        # longer have any authority over. LeaseLostError (not a plain
-        # RuntimeError) so the worker loop can tell this apart from an
-        # ordinary failure and skip release()/backoff entirely.
         raise LeaseLostError(f"lease lost during {log_name}, another worker has taken over")
 
-    return proc.returncode, str(log_path)
+    return proc.returncode, stdout, str(log_path), duration_ms
+
+def extract_patch(repo_dir: Path, base_sha: str, out_path: Path) -> None:
+    """
+    Diffs base_sha (the clone's original HEAD, captured in handle_patching
+    before the bump commit went on top) against the current HEAD, and
+    writes the result to out_path.
+
+    Run directly on the host, not sandboxed: git diff between two
+    already-committed shas doesn't execute any repo-controlled code --
+    there's nothing here to sandbox against, unlike install/build/test.
+    /repo is bind-mounted, so this sees exactly the file state a
+    container-side diff would see after the build step wrote to it --
+    host and container share the same underlying directory.
+
+    Diffing two real commits, rather than uncommitted worktree changes,
+    is what makes new/deleted/modified files all fall out of one plain
+    `git diff` -- no --no-index special-casing for new files, and no
+    risk of a .gitignore'd file leaking in (it was never `git add`ed
+    into either commit to begin with).
+    """
+    result = subprocess.run(
+        ["git", "diff", base_sha, "HEAD"],
+        cwd=repo_dir, capture_output=True, text=True, timeout=60,
+    )
+    out_path.write_text(result.stdout)
 
 
 def handle_building(run: dict, conn: psycopg.Connection, worker_id: str) -> tuple[str, dict]:
-    """
-    Real subprocess build: npm ci && npm run build, in the repo cloned
-    by handle_patching. Full log goes to disk; only exit code + log
-    path go in the checkpoint (the design doc's error-shaping work --
-    parsing that log into structured errors -- comes later, not week 1).
-    """
-    repo_dir = (run.get("checkpoint") or {}).get("repo_dir") or (run.get("checkpoint") or {}).get("work_dir")
+    checkpoint = run.get("checkpoint") or {}
+    if "ecosystem" not in checkpoint:
+        raise RuntimeError("no ecosystem in checkpoint -- did PATCHING run first?")
+    adapter = ADAPTERS[checkpoint["ecosystem"]]
+    repo_dir = Path(checkpoint.get("repo_dir") or checkpoint["work_dir"])
 
-    ci = subprocess.run(
-        ["npm", "ci"], cwd=repo_dir, capture_output=True, text=True, timeout=BUILD_TIMEOUT_SECONDS,
-    )
-    if ci.returncode != 0:
-        log_dir = RUNS_LOG_DIR / str(run["id"])
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "npm_ci.log"
-        log_path.write_text(ci.stdout + ci.stderr)
-        raise RuntimeError(f"npm ci failed (exit {ci.returncode}), see {log_path}")
+    # Per-repo, not per-run: two runs against the SAME repo must not
+    # install concurrently into the shared cache volume. Keyed on
+    # repo_url (falling back to work_dir for the no-repo stub path,
+    # where every run gets its own tempdir anyway and contention is
+    # impossible) rather than a numeric repos.id -- avoids needing that
+    # join here, and is just as unique.
+    #
+    # Scoped to install+build only (this call), NOT held across into
+    # handle_testing: that's a separately-claimable state that could be
+    # picked up by a different worker's connection, and releasing an
+    # advisory lock from a connection that never held it is a silent
+    # no-op in Postgres -- it would leak this lock on the ORIGINAL
+    # worker's connection until that worker process exits (exactly the
+    # "advisory lock held by a dead connection" bug the plan's own
+    # chaos section warns about). install+build is also where the only
+    # actually-shared mutable resource (the cache volume) gets touched;
+    # TESTING only reads this run's own already-populated repo_dir.
+    repo_key = f"repo:{checkpoint.get('repo_url') or checkpoint['work_dir']}"
+    if not try_lock_repo(conn, repo_key):
+        raise LockContention(repo_key)
 
-    exit_code, log_path = _run_subprocess_step(
-        run, conn, worker_id, ["npm", "run", "build"], "build.log"
-    )
+    try:
+        # There's no adapter.parse_install in the Protocol -- install
+        # failures (missing package, registry unreachable, a
+        # package.json/lockfile mismatch) are a different, usually
+        # simpler class of problem than a build/test failure. But they
+        # still deserve structured shape rather than a bare message, so
+        # this reuses parse_build: none of its tool-specific regexes
+        # (tsc, mypy) match install-time text, so it safely falls
+        # through to the adapter's generic single-error capture -- see
+        # fixtures/parsers/npm_ci_lockfile_mismatch.log for a real
+        # example this was verified against.
+        exit_code, stdout, log_path, duration_ms = _run_subprocess_step(
+            run, conn, worker_id, adapter.install_cmd(), "install.log", phase="install"
+        )
+        if exit_code != 0:
+            install_result = adapter.parse_build(exit_code, stdout, "")
+            install_result.log_ref = log_path
+            install_result.duration_ms = duration_ms
+            _classify_infra_failure(install_result, exit_code)
+            raise BuildFailed(install_result)
 
-    if exit_code != 0:
-        raise RuntimeError(f"npm run build failed (exit {exit_code}), see {log_path}")
+        exit_code, stdout, log_path, duration_ms = _run_subprocess_step(
+            run, conn, worker_id, adapter.build_cmd(), "build.log", phase="build"
+        )
+        # stderr is always "" here: start_sandbox merges it into stdout
+        # (stderr=subprocess.STDOUT in executor.py), so the adapter
+        # only ever sees combined output as stdout.
+        build_result = adapter.parse_build(exit_code, stdout, "")
+        build_result.log_ref = log_path
+        build_result.duration_ms = duration_ms
+        add_source_context(build_result.errors, repo_dir)
+        _classify_infra_failure(build_result, exit_code)
 
-    return "TESTING", {"build_log": log_path, "build_exit_code": exit_code}
+        if build_result.status != "ok":
+            raise BuildFailed(build_result)
+    finally:
+        unlock_repo(conn, repo_key)
+
+    checkpoint_delta = {
+        "build_log": log_path,
+        "build_exit_code": exit_code,
+        "build_result": dataclasses.asdict(build_result),
+    }
+
+    base_sha = checkpoint.get("base_sha")
+    if base_sha:
+        patch_path = log_dir_for(run["id"], run["attempt"]) / "patch.diff"
+        extract_patch(repo_dir, base_sha, patch_path)
+        checkpoint_delta["patch_path"] = str(patch_path)
+
+    return "TESTING", checkpoint_delta
 
 
 def handle_testing(run: dict, conn: psycopg.Connection, worker_id: str) -> tuple[str, dict]:
-    """
-    Real subprocess test run: npm test. Same mechanics as
-    handle_building -- see _run_subprocess_step.
-    """
-    exit_code, log_path = _run_subprocess_step(
-        run, conn, worker_id, ["npm", "test"], "test.log"
+    checkpoint = run.get("checkpoint") or {}
+    if "ecosystem" not in checkpoint:
+        raise RuntimeError("no ecosystem in checkpoint -- did PATCHING run first?")
+    adapter = ADAPTERS[checkpoint["ecosystem"]]
+    repo_dir = Path(checkpoint.get("repo_dir") or checkpoint["work_dir"])
+
+    exit_code, stdout, log_path, duration_ms = _run_subprocess_step(
+        run, conn, worker_id, adapter.test_cmd(), "test.log", phase="test"
     )
+    test_result = adapter.parse_test(exit_code, stdout, "")
+    test_result.log_ref = log_path
+    test_result.duration_ms = duration_ms
+    add_source_context(test_result.errors, repo_dir)
+    _classify_infra_failure(test_result, exit_code)
 
-    if exit_code != 0:
-        raise RuntimeError(f"npm test failed (exit {exit_code}), see {log_path}")
+    if test_result.status != "ok":
+        raise BuildFailed(test_result)
 
-    return "PATCH_READY", {"test_log": log_path, "test_exit_code": exit_code}
-
+    return "PATCH_READY", {
+        "test_log": log_path,
+        "test_exit_code": exit_code,
+        "test_result": dataclasses.asdict(test_result),
+    }
 
 def handle_patch_ready(run: dict, conn: psycopg.Connection, worker_id: str) -> tuple[str, dict]:
     """
