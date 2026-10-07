@@ -1,0 +1,26 @@
+[
+  {
+    "label": "auto-axios-patch",
+    "repo_url": "/private/tmp/claude-501/-Users-shubhamsharma-Downloads-agent/6586d51b-14a9-489c-b873-fc591ee44b28/scratchpad/day6_repos/auto-axios",
+    "dep_name": "axios",
+    "current_version": "1.6.2",
+    "target_version": "1.6.3",
+    "semver_jump": "patch"
+  },
+  {
+    "label": "agent-uuid-major",
+    "repo_url": "/private/tmp/claude-501/-Users-shubhamsharma-Downloads-agent/6586d51b-14a9-489c-b873-fc591ee44b28/scratchpad/day6_repos/agent-uuid",
+    "dep_name": "uuid",
+    "current_version": "3.4.0",
+    "target_version": "9.0.0",
+    "semver_jump": "major"
+  },
+  {
+    "label": "agent-chalk-major",
+    "repo_url": "/private/tmp/claude-501/-Users-shubhamsharma-Downloads-agent/6586d51b-14a9-489c-b873-fc591ee44b28/scratchpad/day6_repos/agent-chalk",
+    "dep_name": "chalk",
+    "current_version": "4.1.2",
+    "target_version": "5.6.2",
+    "semver_jump": "major"
+  }
+]

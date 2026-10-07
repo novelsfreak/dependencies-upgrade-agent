@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import psycopg
+from psycopg.rows import tuple_row
 
 
 class LockContention(Exception):
@@ -37,7 +38,13 @@ class LockContention(Exception):
 
 
 def try_lock_repo(conn: psycopg.Connection, repo_key: str) -> bool:
-    row = conn.execute("SELECT pg_try_advisory_lock(hashtext(%s))", (repo_key,)).fetchone()
+    # Explicit tuple_row, not whatever row_factory this connection
+    # happens to default to -- production leaves it unset (tuples
+    # already), but a caller configured for dict_row would otherwise
+    # break on row[0] here. Same fix, same reason, as agent/messages.py.
+    with conn.cursor(row_factory=tuple_row) as cur:
+        cur.execute("SELECT pg_try_advisory_lock(hashtext(%s))", (repo_key,))
+        row = cur.fetchone()
     conn.commit()
     return bool(row[0])
 

@@ -6,9 +6,17 @@
 # checkpoint.cost_cents start looking implausible -- Groq's rates do move.
 MODEL_PRICING_PER_MILLION = {
     "openai/gpt-oss-120b": {"input": 0.15, "output": 0.60},
+    # Week 5 Day 3: the "cheap model" the plan asks compaction to
+    # summarize with -- confirmed both by price (exactly half of 120b's
+    # rate, real published Groq pricing as of 2026-09) and by
+    # availability (`client.models.list()` against this actual account
+    # confirmed it, unlike e.g. llama-3.1-8b-instant, which this
+    # account's catalog does not carry).
+    "openai/gpt-oss-20b": {"input": 0.075, "output": 0.30},
 }
 
 DEFAULT_MODEL = "openai/gpt-oss-120b"
+CHEAP_MODEL = "openai/gpt-oss-20b"
 
 
 def compute_cost_cents(model: str, tokens_in: int, tokens_out: int) -> float:

@@ -44,6 +44,13 @@ from sandbox.network import EGRESS_NETWORK, PROXY_URL, ensure_egress_proxy
 Handler = Any  # (run: dict, conn: psycopg.Connection, worker_id: str) -> tuple[str, dict]
 
 BUILD_TIMEOUT_SECONDS = 600
+# Week 4 Day 2: capped separately from `attempt` -- attempt counts
+# retries of a single mechanical step (a flaky clone, a transient
+# sandbox failure); revision_count counts genuinely new rounds of "CI
+# said no" or "a reviewer said no", each of which costs a real
+# conversation's worth of tokens. A run that's been revised 3 times
+# and still isn't green needs a human, not a 4th automatic attempt.
+MAX_REVISIONS = 3
 
 
 class BuildFailed(RuntimeError):
@@ -117,12 +124,49 @@ log = logging.getLogger("states")
 
 def handle_created(run: dict, conn: psycopg.Connection, worker_id: str) -> tuple[str, dict]:
     """
-    Nothing to do yet except move forward. This is where, later, the
-    orchestrator would decide PLANNING vs. going straight to a
-    deterministic patch (design doc's cost cascade). For week 1, every
-    CREATED run goes straight to PATCHING.
+    Week 4 Day 5: real triage, not a bare passthrough. Decides AUTO
+    (deterministic bump, zero LLM calls) vs AGENT (needs a real
+    conversation) vs SKIP (deny-listed) before a single dollar gets
+    spent -- exactly the hook this function's own original comment
+    anticipated ("this is where, later, the orchestrator would
+    decide...").
+
+    Only runs when the checkpoint doesn't already dictate the path
+    (checkpoint.get("use_agent") is not None): every seeded run
+    throughout this project's own testing explicitly sets use_agent
+    one way or the other, and that explicit intent is honored as an
+    override rather than silently reclassified.
     """
-    return "PATCHING", {}
+    checkpoint = run.get("checkpoint") or {}
+    if checkpoint.get("use_agent") is not None:
+        return "PATCHING", {}
+
+    dep_name = checkpoint.get("dep_name", "axios")
+    current_version = checkpoint.get("current_version", "1.6.2")
+    target_version = checkpoint.get("target_version", "1.7.0")
+    semver_jump = checkpoint.get("semver_jump")
+    if not semver_jump:
+        from agent.loop import _classify_semver_jump
+        semver_jump = _classify_semver_jump(current_version, target_version)
+
+    from agent.changelog import fetch_changelog
+    from core.triage import classify_upgrade
+
+    changelog_text, _source = fetch_changelog(dep_name, current_version, target_version)
+    classification, reason, fallback = classify_upgrade(dep_name, semver_jump, changelog_text)
+    log.info("run %s: triage classified %s -- %s", run["id"], classification, reason)
+
+    if classification == "SKIP":
+        return "SKIPPED", {"triage_classification": classification, "triage_reason": reason}
+
+    checkpoint_delta = {
+        "use_agent": classification == "AGENT",
+        "triage_classification": classification,
+        "triage_reason": reason,
+    }
+    if fallback:
+        checkpoint_delta["auto_fallback_to_agent"] = True
+    return "PATCHING", checkpoint_delta
 
 
 def handle_patching(run: dict, conn: psycopg.Connection, worker_id: str) -> tuple[str, dict]:
@@ -504,6 +548,28 @@ def handle_building(run: dict, conn: psycopg.Connection, worker_id: str) -> tupl
 
         if build_result.status != "ok":
             raise BuildFailed(build_result)
+    except BuildFailed as e:
+        # Week 4 Day 5: an AUTO-classified minor bump (core/triage.py)
+        # gets one real deterministic attempt, zero tokens spent -- but
+        # unlike a patch bump, a minor release CAN legitimately need a
+        # call-site fix. Retrying this same deterministic path via the
+        # generic attempt/backoff machinery would fail identically
+        # every time (a real code problem isn't transient), burning
+        # through MAX_ATTEMPTS for no reason. Route to the agent
+        # instead -- but only for a genuine code failure, never for
+        # "timeout"/"infra_error" (a container OOM isn't something the
+        # agent can fix either; that one still wants the normal retry).
+        if checkpoint.get("auto_fallback_to_agent") and e.step_result.status == "failed":
+            log.info(
+                "run %s: AUTO build failed for real (not infra/timeout) -- falling back to AGENT_PATCHING",
+                run["id"],
+            )
+            return "AGENT_PATCHING", {
+                "use_agent": True,
+                "auto_fallback_to_agent": False,
+                "build_result": dataclasses.asdict(e.step_result),
+            }
+        raise
     finally:
         unlock_repo(conn, repo_key)
 
@@ -699,6 +765,21 @@ def handle_agent_patching(run: dict, conn: psycopg.Connection, worker_id: str) -
     return run_agent_loop(run, conn, worker_id)
 
 
+def handle_subagent_patching(run: dict, conn: psycopg.Connection, worker_id: str) -> tuple[str, dict]:
+    """
+    Week 6 Day 1: a sub-agent's own turn loop -- narrower tools, its own
+    system prompt, a small turn budget, but the SAME claim/lease/
+    crash-resume machinery every other actionable state gets, since
+    "a worker can die mid-conversation" is exactly as true for a
+    sub-agent as for the main agent loop. Terminates in SUBAGENT_DONE
+    (not actionable -- see core/claim.py), never PATCH_READY/ESCALATED;
+    the PARENT (agent/subagent.py's spawn_sub_agent) is what interprets
+    the result and decides what happens next.
+    """
+    from agent.subagent import run_sub_agent_loop
+    return run_sub_agent_loop(run, conn, worker_id)
+
+
 def handle_pr_open(run: dict, conn: psycopg.Connection, worker_id: str) -> tuple[str, dict]:
     """
     A PR is open. From here a worker has nothing left to do -- the next
@@ -709,14 +790,115 @@ def handle_pr_open(run: dict, conn: psycopg.Connection, worker_id: str) -> tuple
     return "AWAITING_CI", {}
 
 
-# AWAITING_CI and ESCALATED are deliberately absent from this dict.
-# AWAITING_CI only moves on a webhook (see ACTIONABLE_STATES in
-# core/claim.py). ESCALATED is terminal, same pattern as FAILED --
-# never in ACTIONABLE_STATES, so claim() structurally can never select
-# it and a worker never needs a handler for it. If claim() ever somehow
-# returned a run in either state, HANDLERS[run["state"]] would raise a
-# KeyError rather than silently doing nothing. Loud failure over silent
-# one.
+def handle_revising(run: dict, conn: psycopg.Connection, worker_id: str) -> tuple[str, dict]:
+    """
+    Week 4 Day 2. Entered when CI fails on an already-open PR (api/
+    webhooks.py's check_suite handler), or when a reviewer leaves an
+    actionable comment on it. Neither trigger means "start over" -- by
+    definition this run already reached AWAITING_CI once, so the branch
+    has real, working commits on it. This handler's only job is to set
+    up the NEXT conversation round: re-clone THAT branch (not main,
+    which would lose everything already done), compact the prior round
+    to a short mechanical summary instead of replaying its raw turns
+    (agent/revise.py), and hand off to the ordinary AGENT_PATCHING path
+    -- run_agent_loop itself needs no REVISING-specific logic, it just
+    finds the fresh revision's system+brief messages already there via
+    the revision-scoped load_messages (agent/messages.py).
+
+    checkpoint["revision_trigger"] carries what prompted this round --
+    {"kind": "ci_failure" | "review_comment", "detail": <text>} -- set
+    by whichever webhook handler moved the run into REVISING. Consumed
+    (popped) here since it's a one-time trigger for this round only.
+    """
+    checkpoint = run.get("checkpoint") or {}
+    run_id = run["id"]
+
+    revision_count = checkpoint.get("revision_count", 0)
+    if revision_count >= MAX_REVISIONS:
+        return "ESCALATED", {
+            "escalated_reason": f"revision_count exceeded ({revision_count} >= {MAX_REVISIONS})",
+        }
+    new_revision = revision_count + 1
+
+    branch = checkpoint.get("branch")
+    repo_url = checkpoint.get("repo_url")
+    if not branch or not repo_url:
+        raise RuntimeError(
+            "REVISING requires checkpoint['branch'] and ['repo_url'] from a prior "
+            "handle_patch_ready -- this run never reached PR_OPEN"
+        )
+
+    token = os.environ.get("GITHUB_TOKEN")
+    trigger = checkpoint.get("revision_trigger") or {"kind": "ci_failure", "detail": "(no detail recorded)"}
+
+    if trigger.get("kind") == "ci_failure" and "detail" not in trigger and trigger.get("head_sha"):
+        # api/webhooks.py's check_suite handler deliberately doesn't
+        # make this call itself -- it has a hard 10-second budget and
+        # this is a network round trip. It only records enough to find
+        # the failure later (head_sha); fetching what actually failed
+        # happens here, on the normal worker poll loop, with no such
+        # constraint.
+        from core.github_client import list_check_runs_for_ref, summarize_failed_check_runs
+        repo_slug = _repo_slug_from_url(repo_url)
+        check_runs = list_check_runs_for_ref(token, repo_slug, trigger["head_sha"])
+        trigger = {**trigger, "detail": summarize_failed_check_runs(check_runs)}
+
+    work_dir = Path(tempfile.mkdtemp(prefix=f"run-{run_id}-rev{new_revision}-"))
+    clone_url = repo_url
+    if token and "github.com" in repo_url:
+        clone_url = repo_url.replace("https://github.com/", f"https://x-access-token:{token}@github.com/")
+
+    result = subprocess.run(
+        ["git", "clone", "--depth", "1", "--branch", branch, clone_url, str(work_dir / "repo")],
+        capture_output=True, text=True, timeout=120,
+    )
+    if result.returncode != 0:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        safe_stderr = result.stderr.replace(token, "***") if token else result.stderr
+        raise RuntimeError(f"git clone of revision branch {branch!r} failed: {safe_stderr}")
+    repo_dir = work_dir / "repo"
+
+    from agent.messages import persist_message
+    from agent.prompts import SYSTEM_PROMPT, build_revision_brief
+    from agent.revise import summarize_prior_conversation
+
+    summary = summarize_prior_conversation(conn, run_id, revision_count)
+    task_brief = build_revision_brief(
+        summary=summary,
+        trigger_kind=trigger.get("kind", "ci_failure"),
+        trigger_text=trigger.get("detail", ""),
+        dep_name=checkpoint.get("dep_name", ""),
+        target_version=checkpoint.get("target_version", ""),
+    )
+
+    persist_message(conn, run_id, 0, "system", {"role": "system", "content": SYSTEM_PROMPT},
+                     segment="system", revision=new_revision)
+    persist_message(conn, run_id, 1, "user", {"role": "user", "content": task_brief},
+                     segment="brief", revision=new_revision)
+
+    log.info("run %s: entering revision %s (%s)", run_id, new_revision, trigger.get("kind"))
+
+    new_checkpoint = {
+        **checkpoint,
+        "work_dir": str(work_dir),
+        "repo_dir": str(repo_dir),
+        "use_agent": True,
+        "revision_count": new_revision,
+    }
+    new_checkpoint.pop("revision_trigger", None)
+
+    return "AGENT_PATCHING", new_checkpoint
+
+
+# AWAITING_CI, ESCALATED, and SKIPPED are deliberately absent from this
+# dict. AWAITING_CI only moves on a webhook (see ACTIONABLE_STATES in
+# core/claim.py). ESCALATED and SKIPPED (Week 4 Day 5 -- a deny-listed
+# dependency, decided by handle_created) are both terminal, same
+# pattern as FAILED -- never in ACTIONABLE_STATES, so claim()
+# structurally can never select them and a worker never needs a
+# handler for any of them. If claim() ever somehow returned a run in
+# one of these states, HANDLERS[run["state"]] would raise a KeyError
+# rather than silently doing nothing. Loud failure over silent one.
 HANDLERS: dict[str, Handler] = {
     "CREATED": handle_created,
     "PATCHING": handle_patching,
@@ -725,4 +907,6 @@ HANDLERS: dict[str, Handler] = {
     "TESTING": handle_testing,
     "PATCH_READY": handle_patch_ready,
     "PR_OPEN": handle_pr_open,
+    "REVISING": handle_revising,
+    "SUBAGENT_PATCHING": handle_subagent_patching,
 }

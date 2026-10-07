@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from adapters.npm import NpmAdapter
+from adapters.npm import NpmAdapter, _extract_symbol
 from adapters.pip import PipAdapter
 
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures" / "parsers"
@@ -92,6 +92,39 @@ def test_npm_ci_lockfile_mismatch_fixture():
     assert result.error_count == 1
     assert "Missing" in result.errors[0].message
     assert "lock file" in result.errors[0].message
+
+
+def test_extract_symbol_ignores_primitive_types_and_local_vars():
+    # Week 4 Day 4: this project's own real tsc fixture quotes 'string'/
+    # 'number' (primitive types) and 'brokenTypeError' (a local var) --
+    # a naive "first quoted token" extraction would treat those as
+    # symbols to correlate against a changelog, which is pure noise. No
+    # known-meaningful pattern matches either real line, so both must
+    # come back None.
+    assert _extract_symbol("Type 'string' is not assignable to type 'number'.") is None
+    assert _extract_symbol("'brokenTypeError' is declared but its value is never read.") is None
+
+
+def test_extract_symbol_finds_real_uuid_regression_subpath():
+    # The exact real error this project's own agent-upgrade-fixture
+    # repo produced for the uuid v3->v9 deep-import removal.
+    message = (
+        "Error [ERR_PACKAGE_PATH_NOT_EXPORTED]: Package subpath './v4' "
+        'is not defined by "exports" in node_modules/uuid/package.json'
+    )
+    assert _extract_symbol(message) == "v4"
+
+
+def test_extract_symbol_finds_ts_member_not_exist():
+    assert _extract_symbol("Property 'request' does not exist on type 'HttpClient'.") == "HttpClient.request"
+
+
+def test_extract_symbol_finds_ts_no_exported_member():
+    assert _extract_symbol("Module '\"axios\"' has no exported member 'AxiosInstance'.") == "AxiosInstance"
+
+
+def test_extract_symbol_finds_ts_cannot_find_name():
+    assert _extract_symbol("Cannot find name 'oldHelper'.") == "oldHelper"
 
 
 def test_caps_at_six_and_reports_true_total():

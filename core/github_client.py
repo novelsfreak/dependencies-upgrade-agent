@@ -57,3 +57,61 @@ def create_pr(token: str, repo: str, head_branch: str, base_branch: str, title: 
     )
     resp.raise_for_status()
     return resp.json()
+
+
+def list_check_runs_for_ref(token: str, repo: str, ref: str) -> list[dict]:
+    """
+    Week 4 Day 2. Every check run GitHub has recorded for one commit --
+    a check SUITE (what the webhook payload carries) can bundle several
+    check RUNS (one per CI job), and only the runs themselves carry the
+    actual failure output. Deliberately NOT called from api/webhooks.py
+    -- that handler has a hard 10-second budget and this is a network
+    call; it's called later from core/states.py's handle_revising,
+    which runs on the normal worker poll loop with no such constraint.
+    """
+    resp = requests.get(
+        f"{GITHUB_API}/repos/{repo}/commits/{ref}/check-runs",
+        headers=_headers(token),
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json().get("check_runs", [])
+
+
+def summarize_failed_check_runs(check_runs: list[dict]) -> str:
+    """
+    Each check run's `output.summary`/`output.text` is exactly what a
+    CI job chose to report -- usually the actual error output truncated
+    to something readable, which is exactly what the agent needs to
+    diagnose a real failure rather than a bare "CI failed."
+    """
+    failed = [cr for cr in check_runs if cr.get("conclusion") not in ("success", "neutral", "skipped", None)]
+    if not failed:
+        return "CI reported the check suite as failed, but no individual check run's own conclusion says why."
+
+    parts = []
+    for cr in failed:
+        name = cr.get("name", "unknown check")
+        conclusion = cr.get("conclusion", "unknown")
+        output = cr.get("output") or {}
+        summary = (output.get("summary") or "").strip()
+        text = (output.get("text") or "").strip()
+        body = "\n".join(p for p in (summary, text) if p) or "(no output text provided by this check run)"
+        parts.append(f"### {name} ({conclusion})\n{body}")
+    return "\n\n".join(parts)
+
+
+def post_comment(token: str, repo: str, issue_number: int, body: str) -> dict:
+    """
+    Week 4 Day 3. PR review threads and plain PR discussion both use
+    the Issues comment endpoint on GitHub's API -- a pull request IS an
+    issue, API-wise. issue_number is the PR number.
+    """
+    resp = requests.post(
+        f"{GITHUB_API}/repos/{repo}/issues/{issue_number}/comments",
+        headers=_headers(token),
+        json={"body": body},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
