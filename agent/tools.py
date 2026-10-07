@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import fnmatch
+import hashlib
 import re
 import subprocess
 from pathlib import Path
@@ -109,6 +110,14 @@ def read_file(repo_dir: Path, path: str, start: int = 1, end: int = _DEFAULT_REA
     return numbered or f"{path} is empty"
 
 
+# Week 6 Day 5: lines of surrounding context a follow-up read_file
+# should ask for around a match -- narrow enough to save tokens over
+# "read the whole file" (the plan's own point: speculative reads are
+# pure waste), generous enough to actually contain the enclosing
+# function/block in most real source files.
+_SEARCH_RANGE_HINT_LINES = 30
+
+
 def search(repo_dir: Path, pattern: str, glob: str = "**/*") -> str:
     """
     Pure-Python line-scan, not a subprocess call to ripgrep: this
@@ -117,6 +126,12 @@ def search(repo_dir: Path, pattern: str, glob: str = "**/*") -> str:
     this later may not either. Same interface/behavior the plan asks
     for -- capped matches, true count reported -- without a host
     dependency.
+
+    Week 6 Day 5: each match includes a suggested read_file range
+    (line +/- 30) -- "when search returns src/client.ts:88, the
+    follow-up read should be lines 60-120, not the whole file" is the
+    plan's own example, and doing it here means every caller gets it
+    for free rather than the model having to compute it itself.
     """
     try:
         compiled = re.compile(pattern)
@@ -137,7 +152,12 @@ def search(repo_dir: Path, pattern: str, glob: str = "**/*") -> str:
             if compiled.search(line):
                 total += 1
                 if len(matches) < _MAX_SEARCH_MATCHES:
-                    matches.append(f"{rel}:{lineno}:{line.strip()}")
+                    range_start = max(1, lineno - _SEARCH_RANGE_HINT_LINES)
+                    range_end = lineno + _SEARCH_RANGE_HINT_LINES
+                    matches.append(
+                        f"{rel}:{lineno}:{line.strip()} "
+                        f"(suggested read_file range: {range_start}-{range_end})"
+                    )
 
     if total == 0:
         return f"no matches for {pattern!r}"
@@ -174,7 +194,29 @@ def apply_patch(repo_dir: Path, diff: str) -> str:
     On success, commits immediately (matching handle_patching's own
     existing pattern) so extract_patch's base_sha diffing in
     core/states.py keeps working unmodified on this same run later.
+
+    Idempotent by content hash (Week 4 Day 1): the exact diff text is
+    hashed and the hash embedded as a commit trailer. Needed because a
+    resumed run (agent/loop.py's crash-recovery repair path) may
+    re-execute this exact tool call if the process died after the
+    commit landed but before the tool result was persisted -- without
+    this check, the replay would hit "already up to date" territory in
+    the best case or a confusing double-apply/conflict in the worst,
+    for a patch that in reality already succeeded. Checked via `git
+    log` against THIS run's own repo_dir, not any separate ledger --
+    the git history already is the durable record of what's applied.
     """
+    patch_hash = hashlib.sha256(diff.encode()).hexdigest()[:16]
+    already = subprocess.run(
+        ["git", "log", f"--grep=Agent-Patch-Hash: {patch_hash}", "--oneline"],
+        cwd=repo_dir, capture_output=True, text=True,
+    )
+    if already.stdout.strip():
+        return (
+            "patch already applied and committed in an earlier attempt (identical diff, "
+            "recognized by content hash) -- no action taken, nothing to redo here."
+        )
+
     if _BARE_HUNK_RE.search(diff) and not _HUNK_HEADER_RE.search(diff):
         # Observed for real: gpt-oss-120b repeatedly emitted a bare
         # "@@" with no line numbers across FIVE consecutive attempts in
@@ -237,7 +279,7 @@ def apply_patch(repo_dir: Path, diff: str) -> str:
     subprocess.run(["git", "add", "-A"], cwd=repo_dir, capture_output=True, text=True)
     commit = subprocess.run(
         ["git", "-c", "user.email=agent@example.com", "-c", "user.name=upgrade-agent",
-         "commit", "-m", "agent patch"],
+         "commit", "-m", f"agent patch\n\nAgent-Patch-Hash: {patch_hash}"],
         cwd=repo_dir, capture_output=True, text=True,
     )
     if commit.returncode != 0:
@@ -251,6 +293,35 @@ def apply_patch(repo_dir: Path, diff: str) -> str:
     return f"patch applied and committed. Current diff from before your patch:\n\n{applied.stdout}"
 
 
+# Week 5 Day 5: real, scaled to this project's actual per-request
+# ceiling (see agent/context/assembler.py's budget accounting) -- not
+# the plan's 10k, sized for a 200k-window model.
+_SCRATCHPAD_MAX_TOKENS = 1200
+
+
+def write_findings(content: str) -> str:
+    """
+    Rejects an oversized note outright rather than silently truncating
+    it -- the plan's own instruction ("if the agent exceeds it, ask it
+    to condense rather than truncating"). Truncation would cut the note
+    at an arbitrary byte offset, possibly losing exactly the "tried and
+    failed" line that's the whole point of keeping this; asking the
+    model to condense keeps the choice of what to drop with the one
+    party that actually knows what's still load-bearing.
+    """
+    from agent.context.tokenizer import count_tokens
+
+    tokens = count_tokens(content)
+    if tokens > _SCRATCHPAD_MAX_TOKENS:
+        return (
+            f"findings note is {tokens} tokens, over the {_SCRATCHPAD_MAX_TOKENS}-token cap -- "
+            f"nothing was saved. Condense it (drop resolved or obvious items, keep only what's "
+            f"still load-bearing: what you changed, what you ruled out, what's still open) and "
+            f"call write_findings again."
+        )
+    return f"findings saved ({tokens} tokens)."
+
+
 def read_log_tool(run_id: int, attempt: int, kind: str, offset: int = 0, limit: int = 200) -> str:
     try:
         result = _read_log(run_id, attempt, kind, offset, limit)
@@ -262,7 +333,34 @@ def read_log_tool(run_id: int, attempt: int, kind: str, offset: int = 0, limit: 
     return lines or "(empty)"
 
 
-def build_tools(run: dict, conn, worker_id: str) -> dict[str, Callable[..., str]]:
+def _correlate_changelog(build_failed: BuildFailed, changelog_text: str) -> str:
+    """
+    Week 4 Day 4. For each distinct symbol a build/test failure
+    reports, look up whatever part of the changelog actually mentions
+    it (agent/changelog.py's find_relevant_changelog_section) and
+    attach it -- the plan's own example: a build error mentioning
+    `HttpClient.request` should arrive at the model WITH the
+    changelog's own section about `request()` signature changes,
+    rather than making the model cross-reference a possibly-8000-char
+    changelog against a terse error message itself.
+    """
+    if not changelog_text:
+        return ""
+    from agent.changelog import find_relevant_changelog_section
+
+    seen: set[str] = set()
+    blocks: list[str] = []
+    for error in build_failed.step_result.errors:
+        if not error.symbol or error.symbol in seen:
+            continue
+        seen.add(error.symbol)
+        section = find_relevant_changelog_section(changelog_text, error.symbol)
+        if section:
+            blocks.append(f"--- changelog entry possibly relevant to '{error.symbol}' ---\n{section}")
+    return ("\n\n" + "\n\n".join(blocks)) if blocks else ""
+
+
+def build_tools(run: dict, conn, worker_id: str, changelog_text: str = "") -> dict[str, Callable[..., str]]:
     """
     Binds a tool dict to one run/conn/worker_id via closures -- tool
     schemas never expose repo_dir/run_id/conn, only what the model
@@ -285,7 +383,7 @@ def build_tools(run: dict, conn, worker_id: str) -> dict[str, Callable[..., str]
             run["checkpoint"].update(delta)
             return f"build ok. {delta.get('build_result', {})}"
         except BuildFailed as e:
-            return f"build failed: {e}"
+            return f"build failed: {e}{_correlate_changelog(e, changelog_text)}"
 
     def _run_tests(filter: str | None = None) -> str:
         from core.states import BuildFailed, handle_testing
@@ -294,7 +392,7 @@ def build_tools(run: dict, conn, worker_id: str) -> dict[str, Callable[..., str]
             run["checkpoint"].update(delta)
             return f"tests ok. {delta.get('test_result', {})}"
         except BuildFailed as e:
-            return f"tests failed: {e}"
+            return f"tests failed: {e}{_correlate_changelog(e, changelog_text)}"
 
     def _give_up(reason: str) -> str:
         raise GiveUp(reason)
@@ -307,5 +405,6 @@ def build_tools(run: dict, conn, worker_id: str) -> dict[str, Callable[..., str]
         "run_build": lambda: _run_build(),
         "run_tests": lambda filter=None: _run_tests(filter),
         "read_log": lambda kind, offset=0, limit=200: read_log_tool(run["id"], run["attempt"], kind, offset, limit),
+        "write_findings": lambda content: write_findings(content),
         "give_up": lambda reason: _give_up(reason),
     }

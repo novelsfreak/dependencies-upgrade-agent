@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -79,7 +80,16 @@ def seeded_run(tmp_path):
         (dep_id,),
     ).fetchone()["id"]
 
-    (tmp_path / "package.json").write_text('{"name": "fixture", "dependencies": {}}')
+    (tmp_path / "package.json").write_text('{"name": "fixture", "dependencies": {}}\n')
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=fixture@example.com", "-c", "user.name=fixture",
+         "add", "-A"], cwd=tmp_path, check=True,
+    )
+    subprocess.run(
+        ["git", "-c", "user.email=fixture@example.com", "-c", "user.name=fixture",
+         "commit", "-q", "-m", "initial"], cwd=tmp_path, check=True,
+    )
     checkpoint = {
         "repo_dir": str(tmp_path), "work_dir": str(tmp_path),
         "dep_name": "stopcond-dep", "current_version": "1.0.0", "target_version": "2.0.0",
@@ -104,6 +114,7 @@ def _patch_client(monkeypatch, responses):
     fake_client.chat.completions.create.side_effect = responses
     monkeypatch.setattr(loop_module, "_get_client", lambda: fake_client)
     monkeypatch.setattr(loop_module, "heartbeat", lambda conn, run_id, worker_id: True)
+    return fake_client
 
 
 def test_max_turns_escalates(monkeypatch, seeded_run):
@@ -177,6 +188,99 @@ def test_clean_completion_hands_off_to_building(monkeypatch, seeded_run):
 
     next_state, delta = loop_module.run_agent_loop(dict(run), conn, "test-worker")
     assert next_state == "BUILDING"
+
+
+_PACKAGE_JSON_PATCH = (
+    "--- a/package.json\n"
+    "+++ b/package.json\n"
+    "@@ -1 +1 @@\n"
+    '-{"name": "fixture", "dependencies": {}}\n'
+    '+{"name": "fixture-patched", "dependencies": {}}\n'
+)
+
+
+def test_token_ceiling_with_applied_patch_hands_off_to_building(monkeypatch, seeded_run):
+    """
+    Week 4 Day 7: the real Day 6 finding -- a run that already applied
+    a correct, committed patch should never have that work discarded
+    into ESCALATED just because the conversation ran out of budget
+    before the model itself could confirm it. Forcing prompt_tokens=0
+    on every response disables chars_per_token recalibration, so the
+    proactive ceiling check below is driven purely by real message
+    content size (a large read_file result), not live Groq usage.
+    """
+    conn, run = seeded_run
+    repo_dir = run["checkpoint"]["repo_dir"]
+    big_file = os.path.join(repo_dir, "big.txt")
+    with open(big_file, "w") as f:
+        for _ in range(200):
+            f.write("x" * 200 + "\n")
+
+    responses = [
+        fake_response(
+            tool_calls=[FakeToolCall("c1", "apply_patch", json.dumps({"diff": _PACKAGE_JSON_PATCH}))],
+            tokens=(0, 50),
+        ),
+        fake_response(
+            tool_calls=[FakeToolCall("c2", "read_file", json.dumps({"path": "big.txt"}))],
+            tokens=(0, 50),
+        ),
+        # Should never be reached -- the ceiling check trips before a
+        # 3rd request goes out.
+        fake_response(content="should not get here", finish_reason="stop", tokens=(0, 50)),
+    ]
+    _patch_client(monkeypatch, responses)
+
+    next_state, delta = loop_module.run_agent_loop(dict(run), conn, "test-worker")
+    assert next_state == "BUILDING"
+
+
+def test_token_ceiling_without_applied_patch_escalates(monkeypatch, seeded_run):
+    conn, run = seeded_run
+    repo_dir = run["checkpoint"]["repo_dir"]
+    big_file = os.path.join(repo_dir, "big.txt")
+    with open(big_file, "w") as f:
+        for _ in range(200):
+            f.write("x" * 200 + "\n")
+
+    responses = [
+        fake_response(
+            tool_calls=[FakeToolCall(f"c{i}", "read_file", json.dumps({"path": "big.txt"}))],
+            tokens=(0, 50),
+        )
+        for i in range(5)
+    ]
+    _patch_client(monkeypatch, responses)
+
+    next_state, delta = loop_module.run_agent_loop(dict(run), conn, "test-worker")
+    assert next_state == "ESCALATED"
+    assert "per-request cap" in delta["escalated_reason"]
+
+
+def test_fresh_conversation_persists_a_repo_map_when_repo_url_is_a_real_repo(monkeypatch, seeded_run):
+    conn, run = seeded_run
+    # This fixture's checkpoint has no "repo_url" key (see seeded_run
+    # above) -- add one pointing at the real `repos` row the fixture
+    # already created, which is what makes agent/loop.py's repo_map
+    # lookup find a match.
+    conn.execute(
+        "UPDATE runs SET checkpoint = checkpoint || '{\"repo_url\": \"test://stop-conditions-fixture\"}'::jsonb "
+        "WHERE id = %s", (run["id"],),
+    )
+    run = conn.execute("SELECT * FROM runs WHERE id = %s", (run["id"],)).fetchone()
+
+    responses = [fake_response(tool_calls=None, content="done", finish_reason="stop")]
+    _patch_client(monkeypatch, responses)
+
+    loop_module.run_agent_loop(dict(run), conn, "test-worker")
+
+    rows = conn.execute(
+        "SELECT content FROM run_messages WHERE run_id = %s AND tokens_by_segment->>'repo_map' IS NOT NULL",
+        (run["id"],),
+    ).fetchall()
+    assert len(rows) == 1
+    assert "Repo map:" in rows[0]["content"]["content"]
+    assert "package.json" in rows[0]["content"]["content"]
 
 
 def test_malformed_tool_arguments_do_not_crash_the_loop(monkeypatch, seeded_run):
