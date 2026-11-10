@@ -31,6 +31,15 @@ router = APIRouter()
 
 DSN = os.environ.get("DATABASE_URL", "postgresql://agent:agent@localhost:5431/agent")
 
+# Week 4 Day 3. This automation posts as whatever account GITHUB_TOKEN
+# belongs to, not a dedicated GitHub App/bot identity -- so "mentioning
+# the bot" is a configurable trigger phrase, not an @username GitHub
+# would recognize specially. Comma-separated logins, case-insensitive;
+# empty means "no allowlist configured" (see _is_actionable_comment).
+_ALLOWLIST_ENV = os.environ.get("GITHUB_COMMENT_ALLOWLIST", "")
+COMMENT_ALLOWLIST = {u.strip().lower() for u in _ALLOWLIST_ENV.split(",") if u.strip()}
+AGENT_MENTION_TRIGGER = os.environ.get("AGENT_MENTION_TRIGGER", "@upgrade-agent")
+
 
 def verify_signature(secret: str, payload_body: bytes, signature_header: str | None) -> bool:
     """
@@ -92,6 +101,136 @@ def find_run_by_branch(conn: psycopg.Connection, branch: str) -> dict | None:
         return cur.fetchone()
 
 
+def find_run_by_pr(conn: psycopg.Connection, repo_full_name: str, pr_number: int) -> dict | None:
+    """
+    Week 4 Day 3. issue_comment and pull_request_review_comment
+    payloads carry a PR number, never a branch name (unlike
+    check_suite) -- matched against checkpoint->>'pr_number', written
+    by publisher.py once GitHub has actually created the PR (see
+    publisher.py's record_pr_number). Also filtered by repo, since PR
+    numbers are only unique within one repository.
+    """
+    from psycopg.rows import dict_row
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT * FROM runs WHERE checkpoint->>'pr_number' = %s "
+            "AND checkpoint->>'repo_url' LIKE %s ORDER BY id DESC LIMIT 1",
+            (str(pr_number), f"%{repo_full_name}%"),
+        )
+        return cur.fetchone()
+
+
+def _is_actionable_comment(comment: dict) -> bool:
+    """
+    Both conditions the plan requires: the author is on an explicit
+    allowlist, AND the comment actually mentions the agent. An EMPTY
+    allowlist means "nothing is allowlisted", not "anyone is" -- same
+    fail-closed default as GITHUB_WEBHOOK_SECRET being required rather
+    than silently skipping verification. Without this, every PR
+    discussion thread on every repo this token can see would wake the
+    agent.
+    """
+    if not COMMENT_ALLOWLIST:
+        log.warning("GITHUB_COMMENT_ALLOWLIST is not configured -- rejecting all comments")
+        return False
+    author = ((comment.get("user") or {}).get("login") or "").lower()
+    if author not in COMMENT_ALLOWLIST:
+        return False
+    body = comment.get("body") or ""
+    return AGENT_MENTION_TRIGGER.lower() in body.lower()
+
+
+def _move_run_to_revising(conn: psycopg.Connection, run: dict, event_id: int, revision_trigger: dict) -> None:
+    """Shared by both comment handlers -- same guard (must be
+    AWAITING_CI), same state transition, same event bookkeeping."""
+    if run["state"] != "AWAITING_CI":
+        log.info(
+            "run %s got an actionable comment but is in state %s, not AWAITING_CI -- skipping",
+            run["id"], run["state"],
+        )
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE runs SET state = 'REVISING', updated_at = now(), "
+            "checkpoint = checkpoint || %s::jsonb, next_attempt_at = now() WHERE id = %s",
+            (json.dumps({"revision_trigger": revision_trigger}), run["id"]),
+        )
+        cur.execute(
+            "UPDATE inbound_events SET run_id = %s, processed_at = now() WHERE id = %s",
+            (run["id"], event_id),
+        )
+    conn.commit()
+    log.info("run %s: actionable comment from %s -> REVISING", run["id"], revision_trigger.get("author"))
+
+
+def handle_issue_comment(conn: psycopg.Connection, payload: dict, event_id: int) -> None:
+    """
+    General PR discussion (not attached to a specific line) arrives as
+    issue_comment -- a pull request IS an issue, API-wise, and this
+    event fires for comments on plain issues too, which is why the
+    "pull_request" key check below is required, not optional.
+    """
+    if payload.get("action") != "created":
+        return
+    issue = payload.get("issue") or {}
+    if "pull_request" not in issue:
+        return  # a comment on a plain issue, not a PR -- not ours
+
+    comment = payload.get("comment") or {}
+    if not _is_actionable_comment(comment):
+        return
+
+    repo_full_name = (payload.get("repository") or {}).get("full_name")
+    pr_number = issue.get("number")
+    if not repo_full_name or not pr_number:
+        return
+
+    run = find_run_by_pr(conn, repo_full_name, pr_number)
+    if not run:
+        log.info("issue_comment on %s#%s, no matching run found", repo_full_name, pr_number)
+        return
+
+    _move_run_to_revising(conn, run, event_id, {
+        "kind": "review_comment",
+        "detail": comment.get("body", ""),
+        "author": (comment.get("user") or {}).get("login"),
+    })
+
+
+def handle_pull_request_review_comment(conn: psycopg.Connection, payload: dict, event_id: int) -> None:
+    """
+    A comment attached to a specific line of the diff -- unlike
+    issue_comment, GitHub includes the actual diff_hunk it's anchored
+    to right in the payload, no extra lookup needed. A comment without
+    its anchor is close to meaningless (per the plan's own Day 3 note),
+    so it's included directly in what reaches the model.
+    """
+    if payload.get("action") != "created":
+        return
+    comment = payload.get("comment") or {}
+    if not _is_actionable_comment(comment):
+        return
+
+    repo_full_name = (payload.get("repository") or {}).get("full_name")
+    pr_number = (payload.get("pull_request") or {}).get("number")
+    if not repo_full_name or not pr_number:
+        return
+
+    run = find_run_by_pr(conn, repo_full_name, pr_number)
+    if not run:
+        log.info("pull_request_review_comment on %s#%s, no matching run found", repo_full_name, pr_number)
+        return
+
+    path = comment.get("path", "")
+    diff_hunk = comment.get("diff_hunk", "")
+    detail = f"File: {path}\n\n{diff_hunk}\n\nReviewer comment: {comment.get('body', '')}"
+    _move_run_to_revising(conn, run, event_id, {
+        "kind": "review_comment",
+        "detail": detail,
+        "author": (comment.get("user") or {}).get("login"),
+    })
+
+
 def handle_check_suite_completed(conn: psycopg.Connection, payload: dict, event_id: int) -> None:
     if payload.get("action") != "completed":
         # GitHub also sends check_suite for "requested" and
@@ -104,6 +243,7 @@ def handle_check_suite_completed(conn: psycopg.Connection, payload: dict, event_
 
     conclusion = payload.get("check_suite", {}).get("conclusion")
     branch = payload.get("check_suite", {}).get("head_branch")
+    head_sha = payload.get("check_suite", {}).get("head_sha")
 
     if not branch:
         log.warning("check_suite.completed with no head_branch, ignoring")
@@ -124,18 +264,30 @@ def handle_check_suite_completed(conn: psycopg.Connection, payload: dict, event_
         )
         return
 
+    checkpoint_delta: dict = {}
     if conclusion == "success":
         next_state = "MERGED_READY"
+    elif (run.get("checkpoint") or {}).get("use_agent"):
+        # An agent-driven run already has a real conversation and real
+        # commits on this branch (Week 4 Day 2) -- REVISING resumes
+        # that work with the CI failure as new context, rather than
+        # PATCHING's from-scratch re-clone-and-bump. PATCHING would
+        # just reapply the identical deterministic manifest bump and
+        # land back here unchanged -- nothing about a CI failure on an
+        # agent-fixed upgrade is a manifest-bump problem.
+        next_state = "REVISING"
+        checkpoint_delta = {"revision_trigger": {"kind": "ci_failure", "head_sha": head_sha}}
     else:
         next_state = "PATCHING"
 
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE runs SET state = %s, updated_at = now(), "
+            "checkpoint = checkpoint || %s::jsonb, "
             "attempt = CASE WHEN %s = 'PATCHING' THEN attempt + 1 ELSE attempt END, "
             "next_attempt_at = now() "
             "WHERE id = %s",
-            (next_state, next_state, run["id"]),
+            (next_state, json.dumps(checkpoint_delta), next_state, run["id"]),
         )
         cur.execute(
             "UPDATE inbound_events SET run_id = %s, processed_at = now() WHERE id = %s",
@@ -147,6 +299,8 @@ def handle_check_suite_completed(conn: psycopg.Connection, payload: dict, event_
 
 EVENT_HANDLERS = {
     "check_suite": handle_check_suite_completed,
+    "issue_comment": handle_issue_comment,
+    "pull_request_review_comment": handle_pull_request_review_comment,
 }
 
 

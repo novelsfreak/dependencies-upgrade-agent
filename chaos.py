@@ -73,7 +73,19 @@ DRAIN_SECONDS = 60  # settle time after chaos stops, before assertions run
 # update this -- chaos.py deliberately does not import it, so a worker
 # code change can't silently change what chaos.py thinks "actionable"
 # means without a human noticing the drift.
-ACTIONABLE_STATES = ["CREATED", "PATCHING", "BUILDING", "TESTING", "PATCH_READY", "PR_OPEN"]
+#
+# Week 6 Day 7: this had drifted -- AGENT_PATCHING (week 3), REVISING
+# (week 4), and SUBAGENT_PATCHING (week 6) were all missing, meaning
+# check_no_stuck_runs below would have silently missed a genuinely
+# stuck run sitting in any of those three states. The "don't import
+# it" tradeoff only works if the manual copy actually gets updated when
+# the real list does -- caught by re-reading this file while adding
+# Day 7's new invariant checks, not by anything that would have failed
+# loudly on its own.
+ACTIONABLE_STATES = [
+    "CREATED", "PATCHING", "AGENT_PATCHING", "BUILDING", "TESTING",
+    "PATCH_READY", "PR_OPEN", "REVISING", "SUBAGENT_PATCHING",
+]
 
 # AWAITING_CI is excluded on purpose: a run sitting there with no
 # owner and an old updated_at is *correct*, not stuck -- it's waiting
@@ -591,6 +603,138 @@ def check_run_dirs_match_db(conn: psycopg.Connection) -> list[str]:
     return [f"runs/{i}/ on disk has no matching row in runs table" for i in sorted(orphaned)]
 
 
+# Week 6 Day 7's own assertion list, in a state a run genuinely will
+# never be worked on again from -- narrower than chaos.py's older
+# TERMINAL_STATES (which exists only to print a cosmetic marker):
+# AWAITING_CI and PR_OPEN are deliberately excluded here even though
+# no worker will pick them up on its own, because they're still
+# "alive" -- a webhook can still move them forward, so a sub-agent
+# whose parent sits in one of those isn't orphaned, just waiting on
+# the same outside event its parent is.
+REALLY_TERMINAL_STATES = ["MERGED_READY", "FAILED", "ESCALATED", "SKIPPED", "SUBAGENT_DONE"]
+
+
+def check_no_context_window_exceeded(conn: psycopg.Connection) -> list[str]:
+    """
+    Week 6 Day 7: "no rendered context exceeded the window" -- checked
+    against real, billed usage.prompt_tokens (tokens_in), not an
+    estimate. agent/loop.py's own proactive ceiling check is supposed
+    to stop a turn from ever being SENT once it would cross
+    REQUEST_TOKEN_CEILING; this is the independent, after-the-fact
+    verification that it actually held for real runs, not narrated.
+    """
+    from agent.loop import REQUEST_TOKEN_CEILING
+
+    rows = conn.execute(
+        "SELECT run_id, seq, tokens_in FROM run_messages WHERE tokens_in > %s",
+        (REQUEST_TOKEN_CEILING,),
+    ).fetchall()
+    return [
+        f"run {r['run_id']} seq {r['seq']}: tokens_in={r['tokens_in']} exceeded "
+        f"REQUEST_TOKEN_CEILING={REQUEST_TOKEN_CEILING} -- the proactive check should have stopped this"
+        for r in rows
+    ]
+
+
+def check_no_dangling_tool_calls(conn: psycopg.Connection, run_ids: list[str]) -> list[str]:
+    """
+    Week 6 Day 7: "no tool_use block without a matching tool_result."
+    Only meaningful for runs that reached a state from which nothing
+    will ever repair them further -- a run still mid-flight (or
+    reclaimable) legitimately has a dangling call sitting there waiting
+    for agent/loop.py's own crash-repair path, which is not a bug.
+    """
+    from agent.loop import _pending_tool_calls
+    from agent.messages import load_messages
+
+    problems = []
+    rows = conn.execute(
+        "SELECT id, state, checkpoint FROM runs WHERE id = ANY(%s) AND state = ANY(%s)",
+        (run_ids, REALLY_TERMINAL_STATES),
+    ).fetchall()
+    for r in rows:
+        revision = (r["checkpoint"] or {}).get("revision_count", 0)
+        messages = [m["content"] for m in load_messages(conn, r["id"], revision=revision)]
+        if _pending_tool_calls(messages):
+            problems.append(f"run {r['id']} (state={r['state']}) has a dangling tool_calls with no tool_result")
+    return problems
+
+
+def check_no_orphaned_subagents(conn: psycopg.Connection) -> list[str]:
+    """
+    Week 6 Day 7: "no sub-agent orphaned (parent terminal, child still
+    running)." A sub-agent left in SUBAGENT_PATCHING while its parent
+    has reached a really-terminal state (see REALLY_TERMINAL_STATES
+    above) will never be claimed again by anything that would notice
+    it -- claim() only picks it up on its own merits, but nothing ever
+    tells the parent's caller to look at it once the parent itself is
+    done.
+    """
+    rows = conn.execute(
+        """
+        SELECT child.id AS child_id, child.state AS child_state,
+               parent.id AS parent_id, parent.state AS parent_state
+        FROM runs child
+        JOIN runs parent ON parent.id = child.parent_run_id
+        WHERE child.state != 'SUBAGENT_DONE'
+          AND parent.state = ANY(%s)
+        """,
+        (REALLY_TERMINAL_STATES,),
+    ).fetchall()
+    return [
+        f"sub-agent run {r['child_id']} (state={r['child_state']}) orphaned -- "
+        f"parent run {r['parent_id']} already reached terminal state {r['parent_state']!r}"
+        for r in rows
+    ]
+
+
+def check_no_run_exceeded_max_cost(conn: psycopg.Connection, run_ids: list[str]) -> list[str]:
+    """
+    Week 6 Day 7: "no run exceeded max_cost, including sub-agent
+    spend." total_cost_cents (agent/messages.py) already sums a run's
+    own conversation, its own compaction calls, AND every direct
+    sub-agent's spend -- exactly the number MAX_COST_CENTS is supposed
+    to bound. A small tolerance (one extra turn's worth) is allowed:
+    the real check in agent/loop.py is BEFORE the call that would
+    exceed budget, so the final total can land slightly over, never
+    wildly over.
+    """
+    from agent.loop import MAX_COST_CENTS
+    from agent.messages import total_cost_cents
+
+    tolerance_cents = MAX_COST_CENTS * 0.25
+    problems = []
+    for run_id in run_ids:
+        cost = total_cost_cents(conn, int(run_id))
+        if cost > MAX_COST_CENTS + tolerance_cents:
+            problems.append(
+                f"run {run_id}: total_cost_cents={cost:.2f} exceeds MAX_COST_CENTS={MAX_COST_CENTS} "
+                f"by more than the {tolerance_cents:.2f}-cent tolerance"
+            )
+    return problems
+
+
+def report_cache_hit_rate(conn: psycopg.Connection, run_ids: list[str]) -> None:
+    """
+    Week 6 Day 7: "cache hit rate above threshold across the chaos
+    run" -- reported, not hard-failed: a chaos run seeds a mix of AUTO
+    (zero-token) and short-lived escalated runs alongside any real
+    multi-turn AGENT conversations, and the first two categories
+    contribute no cache data at all. A blanket threshold across
+    everything would be measuring the seed mix, not the caching.
+    """
+    from agent.context.report import cache_hit_rate_for_run
+
+    rates = [
+        r for r in (cache_hit_rate_for_run(conn, int(run_id)) for run_id in run_ids) if r is not None
+    ]
+    if not rates:
+        print("  no cache data across these runs (no multi-turn AGENT conversations with cacheable prefixes)")
+        return
+    avg = sum(rates) / len(rates)
+    print(f"  cache hit rate across {len(rates)} run(s) with data: avg={avg:.1%}, min={min(rates):.1%}, max={max(rates):.1%}")
+
+
 def report_final_states(conn: psycopg.Connection, run_ids: list[str]) -> None:
     rows = conn.execute(
         "SELECT id, state, attempt, lease_owner FROM runs WHERE id = ANY(%s) ORDER BY id",
@@ -707,6 +851,37 @@ def _run_invariant_checks(conn: psycopg.Connection, run_ids: list[str], all_prob
     print(f"  {len(problems)} problem(s) found" if problems else "  none found")
     for p in problems:
         print(f"  FAIL: {p}")
+
+    print("\n[8] no rendered context exceeded the window (round 3, context era)")
+    problems = check_no_context_window_exceeded(conn)
+    all_problems += problems
+    print(f"  {len(problems)} problem(s) found" if problems else "  none found")
+    for p in problems:
+        print(f"  FAIL: {p}")
+
+    print("\n[9] no dangling tool_calls on a terminal run (round 3, context era)")
+    problems = check_no_dangling_tool_calls(conn, run_ids)
+    all_problems += problems
+    print(f"  {len(problems)} problem(s) found" if problems else "  none found")
+    for p in problems:
+        print(f"  FAIL: {p}")
+
+    print("\n[10] no orphaned sub-agents (round 3, context era)")
+    problems = check_no_orphaned_subagents(conn)
+    all_problems += problems
+    print(f"  {len(problems)} problem(s) found" if problems else "  none found")
+    for p in problems:
+        print(f"  FAIL: {p}")
+
+    print("\n[11] no run exceeded max_cost, including sub-agent spend (round 3, context era)")
+    problems = check_no_run_exceeded_max_cost(conn, run_ids)
+    all_problems += problems
+    print(f"  {len(problems)} problem(s) found" if problems else "  none found")
+    for p in problems:
+        print(f"  FAIL: {p}")
+
+    print("\n[12] cache hit rate (informational, round 3, context era)")
+    report_cache_hit_rate(conn, run_ids)
 
 
 if __name__ == "__main__":

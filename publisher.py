@@ -10,6 +10,7 @@ the deterministic branch naming in core/states.py's handle_patch_ready).
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -67,6 +68,23 @@ def mark_published(conn: psycopg.Connection, outbox_id: int) -> None:
     conn.commit()
 
 
+def record_pr_number(conn: psycopg.Connection, run_id: int, pr_number: int) -> None:
+    """
+    Week 4 Day 3: a comment webhook (issue_comment,
+    pull_request_review_comment) carries a PR number, never a branch
+    name -- unlike check_suite, which conveniently does. Without this,
+    api/webhooks.py has no way to map a review comment back to the run
+    it belongs to. Written here, not by handle_patch_ready itself,
+    because the PR number only exists once GitHub has actually created
+    it -- which is this process's job, not the worker's.
+    """
+    conn.execute(
+        "UPDATE runs SET checkpoint = checkpoint || %s::jsonb WHERE id = %s",
+        (json.dumps({"pr_number": pr_number}), run_id),
+    )
+    conn.commit()
+
+
 def publish_open_pr(conn: psycopg.Connection, row: dict) -> None:
     payload = row["payload"]
     token = os.environ["GITHUB_TOKEN"]
@@ -84,6 +102,7 @@ def publish_open_pr(conn: psycopg.Connection, row: dict) -> None:
             "outbox row %s: PR already exists (#%s) for branch %s, marking published",
             row["id"], existing["number"], head_branch,
         )
+        record_pr_number(conn, row["run_id"], existing["number"])
         mark_published(conn, row["id"])
         return
 
@@ -95,6 +114,7 @@ def publish_open_pr(conn: psycopg.Connection, row: dict) -> None:
         body=payload["body"],
     )
     log.info("outbox row %s: created PR #%s (%s)", row["id"], pr["number"], pr["html_url"])
+    record_pr_number(conn, row["run_id"], pr["number"])
     mark_published(conn, row["id"])
 
 

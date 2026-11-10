@@ -149,12 +149,76 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "write_findings",
+            "description": (
+                "Save your own running notes on this upgrade -- what you've changed, what you've "
+                "tried and ruled out, and what's still open. This note SURVIVES context compaction "
+                "verbatim (nothing else does), so if older tool output gets compacted away later, "
+                "this is what you'll still have. Call it before each build attempt with your current "
+                "state: what's changed, what you tried and failed (so you don't retry it), what "
+                "you've learned, and what's still open. Each call REPLACES the previous note -- this "
+                "is your one running note, not a log -- so include everything still relevant, not "
+                "just what's new."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "your complete current findings note"},
+                },
+                "required": ["content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "give_up",
             "description": (
                 "Stop and hand this run back for a human to look at. Call this when you've made a "
                 "genuine attempt and are stuck -- a peer dependency conflict, a migration that isn't "
                 "documented, or the same fix failing repeatedly. This is not a failure on your part; "
                 "continuing to retry a truly stuck run wastes money for no better outcome."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string", "description": "specific -- what you tried, what's blocking you"},
+                },
+                "required": ["reason"],
+            },
+        },
+    },
+]
+
+# Week 6 Day 2: the test-fixer sub-agent's deliberately narrow tool
+# set -- no list_files (it's told exactly which test file it owns), no
+# run_build (a broken build isn't its problem to diagnose), no
+# write_findings (a 10-turn task doesn't need a scratchpad), no give_up
+# (cannot_fix below is the same idea, named for what this task actually is).
+SUBAGENT_TOOL_SCHEMAS = [
+    next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "read_file"),
+    next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "search"),
+    next(s for s in TOOL_SCHEMAS if s["function"]["name"] == "apply_patch"),
+    {
+        "type": "function",
+        "function": {
+            "name": "run_tests",
+            "description": (
+                "Run ONLY the one test you were asked to fix. Call this to confirm your fix actually "
+                "works before finishing -- do not assume a patch is correct without running it."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cannot_fix",
+            "description": (
+                "Stop and report that you could not fix this test after a genuine attempt. This is a "
+                "correct outcome, not a failure -- it hands the test back to a wider-context reviewer "
+                "rather than wasting turns on a fix you don't have. NEVER weaken or remove the test's "
+                "own assertions to make it pass artificially; call this instead."
             ),
             "parameters": {
                 "type": "object",

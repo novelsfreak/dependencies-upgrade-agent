@@ -27,6 +27,11 @@ ACTIONABLE_STATES = [
     "TESTING",
     "PATCH_READY",
     "PR_OPEN",
+    "REVISING",
+    # Week 6 Day 1: a sub-agent is a run like any other -- claimable,
+    # leased, heartbeated, crash-resumable via the exact same machinery,
+    # not a parallel system built from scratch.
+    "SUBAGENT_PATCHING",
 ]
 
 LEASE_DURATION = "2 minutes"
@@ -67,6 +72,45 @@ def claim(conn: psycopg.Connection, worker_id: str) -> dict[str, Any] | None:
                 "lease": LEASE_DURATION,
                 "actionable": ACTIONABLE_STATES,
             },
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return row
+
+
+def claim_specific(conn: psycopg.Connection, run_id: int, worker_id: str) -> dict[str, Any] | None:
+    """
+    Like claim(), but for exactly ONE known run_id rather than "any
+    actionable row" -- needed by anything that must drive a SPECIFIC
+    run to completion synchronously (agent/subagent.py's
+    _advance_until_terminal, bench.py) without touching or being
+    blocked by unrelated actionable rows elsewhere in the table.
+
+    Real bug this replaced: a synchronous driver loop using plain
+    claim() in a table that also has OTHER actionable rows (e.g. the
+    calling parent's own run, still sitting in AGENT_PATCHING while it
+    waits on a sub-agent) can claim the WRONG row -- and if it then
+    releases what it claimed back to itself in a mismatch-detection
+    branch, next_attempt_at doesn't move far enough to stop claim()'s
+    "earliest next_attempt_at wins" ordering from picking that same
+    wrong row again immediately, which ping-pongs forever instead of
+    ever reaching the row this loop actually needs to advance.
+    """
+    sql = """
+        UPDATE runs SET
+            lease_owner = %(worker_id)s,
+            lease_expires_at = now() + %(lease)s::interval,
+            updated_at = now()
+        WHERE id = %(run_id)s
+          AND state = ANY(%(actionable)s)
+          AND next_attempt_at <= now()
+          AND (lease_expires_at IS NULL OR lease_expires_at < now())
+        RETURNING *;
+    """
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            sql,
+            {"run_id": run_id, "worker_id": worker_id, "lease": LEASE_DURATION, "actionable": ACTIONABLE_STATES},
         )
         row = cur.fetchone()
     conn.commit()

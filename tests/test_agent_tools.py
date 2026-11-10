@@ -10,7 +10,9 @@ from pathlib import Path
 
 import pytest
 
-from agent.tools import apply_patch, list_files, read_file, search
+from adapters.base import BuildError, StepResult
+from agent.tools import _correlate_changelog, apply_patch, list_files, read_file, search, write_findings
+from core.states import BuildFailed
 
 
 @pytest.fixture
@@ -67,6 +69,11 @@ def test_search_finds_the_deep_import_pattern(repo_dir):
     assert "src/b.js:1:" in result
 
 
+def test_search_suggests_a_read_range_around_each_match(repo_dir):
+    result = search(repo_dir, r"require\('uuid/v4'\)")
+    assert "suggested read_file range:" in result
+
+
 def test_search_reports_true_count_when_no_matches(repo_dir):
     result = search(repo_dir, "nonexistent_pattern_xyz")
     assert "no matches" in result
@@ -97,6 +104,29 @@ index 0000000..1234567
     assert "applied and committed" in result
     assert (repo_dir / "src" / "a.js").read_text() == "line1\nline2 modified\nline3\n"
     assert (repo_dir / "new.txt").read_text() == "new content\n"
+
+
+def test_apply_patch_is_idempotent_on_replay(repo_dir):
+    # Week 4 Day 1: a resumed run may re-execute an apply_patch call
+    # whose commit already landed before a crash cut off the tool
+    # result (agent/loop.py's _pending_tool_calls repair path). The
+    # second call must recognize that and no-op, not error out on a
+    # diff that no longer matches the (already-changed) file.
+    diff = """--- a/src/a.js
++++ b/src/a.js
+@@ -1,3 +1,3 @@
+ line1
+-line2
++line2 modified
+ line3
+"""
+    first = apply_patch(repo_dir, diff)
+    assert "applied and committed" in first
+
+    second = apply_patch(repo_dir, diff)
+    assert "already applied" in second
+    # Nothing changed the second time -- one commit, same file content.
+    assert (repo_dir / "src" / "a.js").read_text() == "line1\nline2 modified\nline3\n"
 
 
 def test_apply_patch_rejects_mismatched_context(repo_dir):
@@ -149,3 +179,73 @@ def test_apply_patch_bare_hunk_header_gets_specific_correction(repo_dir):
     result = apply_patch(repo_dir, diff)
     assert "hunk header is missing line numbers" in result
     assert "@@ -1,7 +1,7 @@" in result  # the example format, not the model's broken one
+
+
+# --- Week 4 Day 4: changelog correlation ------------------------------------
+
+# Real shape (source and symbol), synthetic text -- kept network-
+# independent for CI. Verified live against the ACTUAL uuid v3->v9
+# changelog during development: this exact symbol ("v4") and exact
+# error message shape correctly found and attached the real "v4()
+# method...removed" breaking-change section, which is what this
+# fixture text is modeled on.
+_REAL_SHAPE_CHANGELOG = """## [7.0.0](https://github.com/uuidjs/uuid/compare/v3.4.0...v7.0.0)
+
+### BREAKING CHANGES
+
+- The default export, which used to be the v4() method, has been removed.
+- Deep imports of the different uuid version functions are deprecated.
+"""
+
+
+def test_correlate_changelog_attaches_matching_section_for_real_error_shape():
+    step_result = StepResult(
+        status="failed", error_count=1,
+        errors=[BuildError(
+            file="src/order.js", line=1, col=None, code=None,
+            message="Package subpath './v4' is not defined by exports", symbol="v4",
+        )],
+    )
+    result = _correlate_changelog(BuildFailed(step_result), _REAL_SHAPE_CHANGELOG)
+    assert "v4() method" in result
+    assert "removed" in result
+
+
+def test_correlate_changelog_dedupes_repeated_symbols():
+    step_result = StepResult(
+        status="failed", error_count=2,
+        errors=[
+            BuildError(file="a.js", line=1, col=None, code=None, message="m1", symbol="v4"),
+            BuildError(file="b.js", line=2, col=None, code=None, message="m2", symbol="v4"),
+        ],
+    )
+    result = _correlate_changelog(BuildFailed(step_result), _REAL_SHAPE_CHANGELOG)
+    assert result.count("v4() method") == 1  # attached once, not once per error
+
+
+def test_correlate_changelog_returns_empty_when_no_symbol_matches():
+    step_result = StepResult(
+        status="failed", error_count=1,
+        errors=[BuildError(file="a.js", line=1, col=None, code=None, message="m", symbol=None)],
+    )
+    assert _correlate_changelog(BuildFailed(step_result), _REAL_SHAPE_CHANGELOG) == ""
+
+
+def test_correlate_changelog_returns_empty_with_no_changelog_text():
+    step_result = StepResult(
+        status="failed", error_count=1,
+        errors=[BuildError(file="a.js", line=1, col=None, code=None, message="m", symbol="v4")],
+    )
+    assert _correlate_changelog(BuildFailed(step_result), "") == ""
+
+
+def test_write_findings_accepts_a_note_under_the_cap():
+    result = write_findings("Changed: a.js. Tried and failed: nothing yet. Open: run build.")
+    assert "findings saved" in result
+
+
+def test_write_findings_rejects_an_oversized_note_without_truncating():
+    oversized = "x " * 5000  # well over the 1200-token cap
+    result = write_findings(oversized)
+    assert "nothing was saved" in result
+    assert "condense" in result.lower()

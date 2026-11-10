@@ -27,6 +27,37 @@ _TSC_ERROR_RE = re.compile(
 # Used to recover a line number jest's JSON doesn't give directly.
 _JEST_STACK_LINE_RE = re.compile(r":(?P<line>\d+):(?P<col>\d+)\)?\s*$", re.MULTILINE)
 
+# Week 4 Day 4: only patterns where the quoted identifier is genuinely
+# an API-surface reference a changelog might document -- NOT a blind
+# "grab the first quoted token" (verified against fixtures/parsers/
+# tsc_type_error.log's own real content: its two real errors quote
+# 'string'/'number' and a local variable name, neither of which any
+# changelog entry would ever mention; a naive extraction would
+# correlate against noise on every real type-mismatch error).
+_TS_MEMBER_NOT_EXIST_RE = re.compile(r"Property '(\w+)' does not exist on type '(\w+)'")
+_TS_NO_EXPORTED_MEMBER_RE = re.compile(r"has no exported member '(\w+)'")
+_TS_CANNOT_FIND_NAME_RE = re.compile(r"Cannot find name '(\w+)'")
+# Node's own "Package subpath './v4' is not defined by exports" --
+# exactly the real failure mode this project's own uuid v3->v9 fixture
+# hit (deep imports removed by the package's own exports map).
+_NODE_SUBPATH_RE = re.compile(r"Package subpath '\.?/?([\w.-]+)' is not defined")
+
+
+def _extract_symbol(message: str) -> str | None:
+    m = _TS_MEMBER_NOT_EXIST_RE.search(message)
+    if m:
+        return f"{m.group(2)}.{m.group(1)}"
+    m = _TS_NO_EXPORTED_MEMBER_RE.search(message)
+    if m:
+        return m.group(1)
+    m = _TS_CANNOT_FIND_NAME_RE.search(message)
+    if m:
+        return m.group(1)
+    m = _NODE_SUBPATH_RE.search(message)
+    if m:
+        return m.group(1)
+    return None
+
 
 class NpmAdapter:
     ecosystem = "npm"
@@ -88,6 +119,7 @@ class NpmAdapter:
                     col=int(m.group("col")),
                     code=m.group("code"),
                     message=m.group("message").strip(),
+                    symbol=_extract_symbol(m.group("message")),
                 )
                 for m in matches
             ]
@@ -166,5 +198,5 @@ class NpmAdapter:
 
     def _generic_failure(self, raw_output: str) -> StepResult:
         tail = raw_output.strip()[-_MAX_MESSAGE_CHARS:]
-        error = BuildError(file="", line=None, col=None, code=None, message=tail)
+        error = BuildError(file="", line=None, col=None, code=None, message=tail, symbol=_extract_symbol(tail))
         return StepResult(status="failed", error_count=1, errors=[error])
